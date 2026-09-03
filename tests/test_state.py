@@ -43,10 +43,12 @@ class AppStateTests(unittest.TestCase):
                 "your_color": WHITE,
                 "board_size": 19,
                 "win_length": 5,
+                "starting_color": WHITE,
             }
         )
         self.assertEqual(state.board_size, 19)
         self.assertEqual(state.win_length, 5)
+        self.assertEqual(state.starting_color, WHITE)
         self.assertTrue(all(len(row) == 19 for row in state.board))
 
     def test_game_start_can_change_board_size(self) -> None:
@@ -63,6 +65,21 @@ class AppStateTests(unittest.TestCase):
         self.assertEqual(len(state.board), 19)
         self.assertTrue(change.redraw_board)
 
+    def test_white_can_start_from_server_state(self) -> None:
+        state = AppState(my_color=WHITE)
+        state.apply_server_message(
+            {
+                "type": "game_start",
+                "starting_color": WHITE,
+                "current_turn": WHITE,
+            }
+        )
+        self.assertEqual(state.starting_color, WHITE)
+        self.assertEqual(state.current_turn, WHITE)
+        self.assertFalse(state.can_move(7, 7))  # Not connected yet.
+        state.connected = True
+        self.assertTrue(state.can_move(7, 7))
+
     def test_19_board_move_result_updates_edge(self) -> None:
         state = self.playing_state(19)
         change = state.apply_server_message(
@@ -71,6 +88,14 @@ class AppStateTests(unittest.TestCase):
         self.assertEqual(state.board[18][17], WHITE)
         self.assertEqual(state.last_move, (17, 18))
         self.assertTrue(change.redraw_board)
+
+    def test_final_move_accepts_null_next_turn_and_keeps_stone(self) -> None:
+        state = self.playing_state()
+        state.apply_server_message(
+            {"type": "move_result", "x": 7, "y": 7, "color": BLACK, "next_turn": None}
+        )
+        self.assertEqual(state.board[7][7], BLACK)
+        self.assertIsNone(state.current_turn)
 
     def test_game_state_replaces_size_and_board_atomically(self) -> None:
         state = self.playing_state()
@@ -93,10 +118,72 @@ class AppStateTests(unittest.TestCase):
 
     def test_game_over_blocks_moves(self) -> None:
         state = self.playing_state()
-        state.apply_server_message({"type": "game_over", "winner": BLACK, "reason": "five_in_a_row"})
-        self.assertEqual(state.game_status, "GAME_OVER")
+        change = state.apply_server_message(
+            {
+                "type": "game_over",
+                "winner": BLACK,
+                "loser": WHITE,
+                "reason": "five_in_a_row",
+            }
+        )
+        self.assertEqual(state.game_status, "FINISHED")
         self.assertEqual(state.winner, BLACK)
+        self.assertEqual(state.loser, WHITE)
+        self.assertEqual(change.message, "승리했습니다.")
+        self.assertIsNone(state.current_turn)
         self.assertFalse(state.can_move(7, 7))
+
+    def test_normal_loss_and_draw_messages(self) -> None:
+        loss = self.playing_state()
+        loss_change = loss.apply_server_message(
+            {
+                "type": "game_over",
+                "winner": WHITE,
+                "loser": BLACK,
+                "reason": "five_in_a_row",
+            }
+        )
+        self.assertEqual(loss_change.message, "패배했습니다.")
+
+        draw = self.playing_state()
+        draw_change = draw.apply_server_message(
+            {"type": "game_over", "winner": None, "loser": None, "reason": "draw"}
+        )
+        self.assertEqual(draw_change.message, "무승부입니다.")
+
+    def test_forbidden_move_messages(self) -> None:
+        labels = {
+            "DOUBLE_THREE": "3-3 금수",
+            "DOUBLE_FOUR": "4-4 금수",
+            "OVERLINE": "장목 금수",
+        }
+        for forbidden_type, label in labels.items():
+            with self.subTest(forbidden_type=forbidden_type, result="loss"):
+                state = self.playing_state()
+                change = state.apply_server_message(
+                    {
+                        "type": "game_over",
+                        "winner": WHITE,
+                        "loser": BLACK,
+                        "reason": "forbidden_move",
+                        "forbidden_type": forbidden_type,
+                        "x": 7,
+                        "y": 7,
+                    }
+                )
+                self.assertEqual(change.message, f"{label}로 패배했습니다.")
+            with self.subTest(forbidden_type=forbidden_type, result="win"):
+                state = self.playing_state()
+                change = state.apply_server_message(
+                    {
+                        "type": "game_over",
+                        "winner": BLACK,
+                        "loser": WHITE,
+                        "reason": "forbidden_move",
+                        "forbidden_type": forbidden_type,
+                    }
+                )
+                self.assertEqual(change.message, f"상대방의 {label}로 승리했습니다.")
 
     def test_move_eligibility_covers_hover_and_click_conditions(self) -> None:
         state = self.playing_state()
@@ -119,6 +206,77 @@ class AppStateTests(unittest.TestCase):
         self.assertEqual((len(state.board), len(state.board[0])), (19, 19))
         self.assertTrue(all(cell is None for row in state.board for cell in row))
         self.assertEqual(state.game_status, "PLAYING")
+
+    def test_restart_applies_reassigned_color_and_clears_result(self) -> None:
+        state = self.playing_state(19)
+        state.apply_server_message(
+            {
+                "type": "game_over",
+                "winner": WHITE,
+                "loser": BLACK,
+                "reason": "forbidden_move",
+                "forbidden_type": "DOUBLE_THREE",
+            }
+        )
+        state.apply_server_message(
+            {
+                "type": "restart",
+                "your_color": WHITE,
+                "starting_color": WHITE,
+                "current_turn": WHITE,
+                "board_size": 19,
+                "win_length": 5,
+            }
+        )
+        self.assertEqual(state.my_color, WHITE)
+        self.assertEqual(state.starting_color, WHITE)
+        self.assertEqual(state.current_turn, WHITE)
+        self.assertIsNone(state.winner)
+        self.assertIsNone(state.loser)
+        self.assertIsNone(state.game_over_reason)
+        self.assertIsNone(state.forbidden_type)
+        self.assertTrue(state.can_move(18, 18))
+
+    def test_finished_game_state_restores_result(self) -> None:
+        state = AppState(my_color=WHITE, connected=True)
+        board = new_board(19)
+        board[9][9] = WHITE
+        change = state.apply_server_message(
+            {
+                "type": "game_state",
+                "board_size": 19,
+                "win_length": 5,
+                "board": board,
+                "starting_color": WHITE,
+                "current_turn": None,
+                "winner": WHITE,
+                "loser": BLACK,
+                "status": "FINISHED",
+                "game_over_reason": "five_in_a_row",
+                "forbidden_type": None,
+            }
+        )
+        self.assertTrue(state.is_finished)
+        self.assertIsNone(state.current_turn)
+        self.assertEqual(state.starting_color, WHITE)
+        self.assertEqual(state.board[9][9], WHITE)
+        self.assertEqual(change.message, "승리했습니다.")
+        self.assertFalse(state.can_move(8, 8))
+
+    def test_error_does_not_overwrite_finished_result(self) -> None:
+        state = self.playing_state()
+        state.apply_server_message(
+            {"type": "game_over", "winner": BLACK, "loser": WHITE, "reason": "five_in_a_row"}
+        )
+        state.apply_server_message(
+            {
+                "type": "error",
+                "code": "GAME_ALREADY_FINISHED",
+                "message": "The game has already finished.",
+            }
+        )
+        self.assertTrue(state.is_finished)
+        self.assertEqual(state.winner, BLACK)
 
     def test_old_server_messages_fall_back_to_15(self) -> None:
         state = AppState()

@@ -12,6 +12,11 @@ EMPTY = None
 BLACK = "BLACK"
 WHITE = "WHITE"
 VALID_COLORS = {BLACK, WHITE}
+FORBIDDEN_LABELS = {
+    "DOUBLE_THREE": "3-3 금수",
+    "DOUBLE_FOUR": "4-4 금수",
+    "OVERLINE": "장목 금수",
+}
 
 
 def new_board(board_size: int = DEFAULT_BOARD_SIZE) -> list[list[str | None]]:
@@ -30,12 +35,16 @@ class StateChange:
 class AppState:
     room_id: str | None = None
     my_color: str | None = None
+    starting_color: str | None = None
     board_size: int = DEFAULT_BOARD_SIZE
     win_length: int = DEFAULT_WIN_LENGTH
     board: list[list[str | None]] = field(default_factory=list)
     current_turn: str | None = None
     game_status: str = "DISCONNECTED"
     winner: str | None = None
+    loser: str | None = None
+    game_over_reason: str | None = None
+    forbidden_type: str | None = None
     connected: bool = False
     last_move: tuple[int, int] | None = None
 
@@ -69,17 +78,23 @@ class AppState:
             and self.board[y][x] is EMPTY
         )
 
+    @property
+    def is_finished(self) -> bool:
+        return self.game_status in {"FINISHED", "GAME_OVER"}
+
     def apply_server_message(self, data: dict[str, Any]) -> StateChange:
         message_type = data.get("type")
 
         if message_type == "joined":
             color = _required_color(data, "your_color")
+            starting_color = _optional_color(data, "starting_color", self.starting_color)
             room_id = data.get("room_id")
             if not isinstance(room_id, str):
                 raise ValueError("joined.room_id must be a string")
             board_size, win_length = _settings_from_message(data, self.board_size, self.win_length)
             self.room_id = room_id
             self.my_color = color
+            self.starting_color = starting_color
             self.board_size = board_size
             self.win_length = win_length
             self.board = new_board(board_size)
@@ -93,18 +108,23 @@ class AppState:
 
         if message_type == "game_start":
             current_turn = _required_color(data, "current_turn")
+            starting_color = _optional_color(data, "starting_color", current_turn)
             board_size, win_length = _settings_from_message(data, self.board_size, self.win_length)
             redraw = self.apply_board_settings(board_size, win_length)
             self.current_turn = current_turn
+            self.starting_color = starting_color
             self.game_status = "PLAYING"
             self.winner = None
+            self.loser = None
+            self.game_over_reason = None
+            self.forbidden_type = None
             return StateChange(True, self.turn_message(), redraw)
 
         if message_type == "move_result":
             x = _required_coordinate(data, "x", self.board_size)
             y = _required_coordinate(data, "y", self.board_size)
             color = _required_color(data, "color")
-            next_turn = _required_color(data, "next_turn")
+            next_turn = _optional_color(data, "next_turn", None)
             self.board[y][x] = color
             self.last_move = (x, y)
             self.current_turn = next_turn
@@ -114,12 +134,16 @@ class AppState:
             winner = data.get("winner")
             if winner is not None and winner not in VALID_COLORS and winner != "DRAW":
                 raise ValueError("game_over.winner must be BLACK, WHITE, DRAW, or null")
+            loser = _optional_color(data, "loser", None)
+            reason = _optional_string(data, "reason")
+            forbidden_type = _optional_string(data, "forbidden_type")
             self.winner = winner
-            self.game_status = "GAME_OVER"
+            self.loser = loser
+            self.game_over_reason = reason
+            self.forbidden_type = forbidden_type
+            self.game_status = "FINISHED"
             self.current_turn = None
-            reason = data.get("reason")
-            suffix = f" ({reason})" if isinstance(reason, str) and reason else ""
-            return StateChange(True, self.game_over_message() + suffix)
+            return StateChange(True, self.build_game_over_message())
 
         if message_type == "game_state":
             board_size, win_length = _settings_from_message(data, self.board_size, self.win_length)
@@ -133,12 +157,25 @@ class AppState:
             winner = data.get("winner")
             if winner is not None and winner not in VALID_COLORS and winner != "DRAW":
                 raise ValueError("game_state.winner is invalid")
+            starting_color = _optional_color(data, "starting_color", self.starting_color)
+            loser = _optional_color(data, "loser", None)
+            game_over_reason = _optional_string(data, "game_over_reason")
+            forbidden_type = _optional_string(data, "forbidden_type")
+            normalized_status = status.upper()
+            if normalized_status == "GAME_OVER":
+                normalized_status = "FINISHED"
             self.board_size = board_size
             self.win_length = win_length
             self.board = board
             self.current_turn = current_turn
+            self.starting_color = starting_color
             self.winner = winner
-            self.game_status = status.upper()
+            self.loser = loser
+            self.game_over_reason = game_over_reason
+            self.forbidden_type = forbidden_type
+            self.game_status = normalized_status
+            if self.is_finished:
+                self.current_turn = None
             self.last_move = None
             return StateChange(True, self.status_message(), True)
 
@@ -148,12 +185,19 @@ class AppState:
 
         if message_type == "restart":
             current_turn = _required_color(data, "current_turn")
+            my_color = _optional_color(data, "your_color", self.my_color)
+            starting_color = _optional_color(data, "starting_color", current_turn)
             board_size, win_length = _settings_from_message(data, self.board_size, self.win_length)
             self.board_size = board_size
             self.win_length = win_length
             self.board = new_board(board_size)
             self.current_turn = current_turn
+            self.my_color = my_color
+            self.starting_color = starting_color
             self.winner = None
+            self.loser = None
+            self.game_over_reason = None
+            self.forbidden_type = None
             self.game_status = "PLAYING"
             self.last_move = None
             return StateChange(True, self.turn_message(), True)
@@ -176,16 +220,32 @@ class AppState:
             return "Waiting for turn information..."
         return "Your turn." if self.current_turn == self.my_color else "Opponent's turn."
 
-    def game_over_message(self) -> str:
-        if self.winner in (None, "DRAW"):
-            return "Draw."
-        return "You win!" if self.winner == self.my_color else "You lose."
+    def build_game_over_message(self) -> str:
+        is_draw = self.game_over_reason == "draw" or (
+            self.winner in (None, "DRAW") and self.loser is None
+        )
+        if is_draw:
+            return "무승부입니다."
+        if self.game_over_reason == "forbidden_move":
+            label = FORBIDDEN_LABELS.get(self.forbidden_type or "", "금수")
+            if self.loser == self.my_color:
+                return f"{label}로 패배했습니다."
+            if self.winner == self.my_color:
+                return f"상대방의 {label}로 승리했습니다."
+            return f"{label}로 게임이 종료되었습니다."
+        if self.winner == self.my_color:
+            return "승리했습니다."
+        if self.loser == self.my_color or (
+            self.winner in VALID_COLORS and self.winner != self.my_color
+        ):
+            return "패배했습니다."
+        return "게임이 종료되었습니다."
 
     def status_message(self) -> str:
         if self.game_status == "PLAYING":
             return self.turn_message()
-        if self.game_status == "GAME_OVER":
-            return self.game_over_message()
+        if self.is_finished:
+            return self.build_game_over_message()
         if self.game_status == "WAITING":
             return "Waiting for opponent..."
         return self.game_status.replace("_", " ").title() + "."
@@ -225,6 +285,24 @@ def _required_color(data: dict[str, Any], field_name: str) -> str:
     value = data.get(field_name)
     if value not in VALID_COLORS:
         raise ValueError(f"{field_name} must be BLACK or WHITE")
+    return value
+
+
+def _optional_color(
+    data: dict[str, Any], field_name: str, fallback: str | None
+) -> str | None:
+    if field_name not in data:
+        return fallback
+    value = data[field_name]
+    if value is not None and value not in VALID_COLORS:
+        raise ValueError(f"{field_name} must be BLACK, WHITE, or null")
+    return value
+
+
+def _optional_string(data: dict[str, Any], field_name: str) -> str | None:
+    value = data.get(field_name)
+    if value is not None and not isinstance(value, str):
+        raise ValueError(f"{field_name} must be a string or null")
     return value
 
 

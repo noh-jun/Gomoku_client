@@ -19,7 +19,7 @@ class OmokApp:
         self.root = root
         self.root.title("Online Omok")
         self.root.geometry("860x950")
-        self.root.minsize(620, 720)
+        self.root.minsize(760, 720)
         self.state = AppState()
         self.events: Queue[NetworkEvent] = Queue()
         self.network = NetworkClient(self.events)
@@ -29,7 +29,7 @@ class OmokApp:
         self.hover_position: tuple[int, int] | None = None
         self._preview_item_id: int | None = None
 
-        self.server_var = tk.StringVar(value="ws://127.0.0.1:8000")
+        self.server_var = tk.StringVar(value="ws://192.168.1.75:8000")
         self.room_var = tk.StringVar(value="abc123")
         self.you_var = tk.StringVar(value="-")
         self.turn_var = tk.StringVar(value="-")
@@ -63,7 +63,7 @@ class OmokApp:
         self.connect_button = ttk.Button(connection, text="Connect", command=self._connect)
         self.connect_button.grid(row=0, column=4, padx=(5, 0))
 
-        info = ttk.Frame(outer, padding=(0, 7))
+        info = ttk.LabelFrame(outer, text="Game", padding=7)
         info.grid(row=1, column=0, sticky="ew")
         ttk.Label(info, text="You:").grid(row=0, column=0)
         ttk.Label(info, textvariable=self.you_var, width=8).grid(row=0, column=1, sticky="w")
@@ -73,6 +73,8 @@ class OmokApp:
         ttk.Label(info, textvariable=self.status_var, width=13).grid(row=0, column=5, sticky="w")
         ttk.Label(info, textvariable=self.settings_var).grid(row=0, column=6, padx=(12, 0), sticky="e")
         info.columnconfigure(6, weight=1)
+        self.restart_button = ttk.Button(info, text="Restart", command=self._request_restart)
+        self.restart_button.grid(row=0, column=7, padx=(12, 0))
 
         self.canvas = tk.Canvas(
             outer,
@@ -92,8 +94,6 @@ class OmokApp:
         footer.grid(row=3, column=0, sticky="ew")
         ttk.Label(footer, textvariable=self.message_var).grid(row=0, column=0, sticky="w")
         footer.columnconfigure(0, weight=1)
-        self.restart_button = ttk.Button(footer, text="Restart", command=self._request_restart)
-        self.restart_button.grid(row=0, column=1)
 
     def _connect(self) -> None:
         try:
@@ -115,7 +115,7 @@ class OmokApp:
         self.room_entry.configure(state="disabled")
 
     def _request_restart(self) -> None:
-        if not self.state.connected or self.state.game_status != "GAME_OVER" or self._restart_pending:
+        if not self.state.connected or not self.state.is_finished or self._restart_pending:
             return
         self.network.request_restart()
         self._restart_pending = True
@@ -191,9 +191,11 @@ class OmokApp:
             self._clear_hover()
             self.state.connected = True
             self.message_var.set(event.message)
+            self._draw_board()
         elif event.kind == "disconnected":
             self._clear_hover()
             self.state.connected = False
+            self._draw_board()
             self._restart_pending = False
             self.connect_button.configure(state="normal")
             self.server_entry.configure(state="normal")
@@ -238,7 +240,7 @@ class OmokApp:
             f"Board: {self.state.board_size} x {self.state.board_size} / Win: {self.state.win_length}"
         )
         restart_enabled = (
-            self.state.connected and self.state.game_status == "GAME_OVER" and not self._restart_pending
+            self.state.connected and self.state.is_finished and not self._restart_pending
         )
         self.restart_button.configure(state="normal" if restart_enabled else "disabled")
 
@@ -255,6 +257,8 @@ class OmokApp:
         geometry = self._geometry()
         self.canvas.delete("all")
         self._preview_item_id = None
+        if not self.state.connected:
+            return
         self._draw_grid(geometry)
         self._draw_stones(geometry)
         self._render_preview(geometry)
