@@ -26,6 +26,8 @@ class OmokApp:
         self._restart_pending = False
         self._closing = False
         self._resize_after_id: str | None = None
+        self.hover_position: tuple[int, int] | None = None
+        self._preview_item_id: int | None = None
 
         self.server_var = tk.StringVar(value="ws://127.0.0.1:8000")
         self.room_var = tk.StringVar(value="abc123")
@@ -82,6 +84,8 @@ class OmokApp:
         )
         self.canvas.grid(row=2, column=0, sticky="nsew")
         self.canvas.bind("<Button-1>", self._on_board_click)
+        self.canvas.bind("<Motion>", self._on_mouse_move)
+        self.canvas.bind("<Leave>", self._on_mouse_leave)
         self.canvas.bind("<Configure>", self._on_canvas_configure)
 
         footer = ttk.Frame(outer, padding=(0, 7, 0, 0))
@@ -100,6 +104,7 @@ class OmokApp:
         if not started:
             self.message_var.set("A connection is already active.")
             return
+        self._clear_hover()
         self.state = AppState()
         self._restart_pending = False
         self._draw_board()
@@ -118,7 +123,7 @@ class OmokApp:
         self._render_status()
 
     def _on_board_click(self, event: tk.Event[tk.Misc]) -> None:
-        coordinate = self._geometry().pixel_to_board(event.x, event.y)
+        coordinate = self._pointer_to_board(event.x, event.y)
         if coordinate is None:
             return
         x, y = coordinate
@@ -133,7 +138,33 @@ class OmokApp:
                 self.message_var.set("That position is already occupied.")
             return
         self.network.send_move(x, y)
+        self._clear_hover()
         self.message_var.set(f"Move ({x}, {y}) sent. Waiting for server...")
+
+    def _on_mouse_move(self, event: tk.Event[tk.Misc]) -> None:
+        coordinate = self._pointer_to_board(event.x, event.y)
+        if coordinate is not None and not self.state.can_move(*coordinate):
+            coordinate = None
+        self._set_hover_position(coordinate)
+
+    def _on_mouse_leave(self, _event: tk.Event[tk.Misc]) -> None:
+        self._clear_hover()
+
+    def _pointer_to_board(self, pixel_x: float, pixel_y: float) -> tuple[int, int] | None:
+        """Shared pointer conversion for hover preview and actual clicks."""
+        return self._geometry().pixel_to_board(pixel_x, pixel_y)
+
+    def _set_hover_position(self, coordinate: tuple[int, int] | None) -> None:
+        if coordinate == self.hover_position:
+            return
+        self.hover_position = coordinate
+        self._render_preview(self._geometry())
+
+    def _clear_hover(self) -> None:
+        self.hover_position = None
+        if self._preview_item_id is not None:
+            self.canvas.delete(self._preview_item_id)
+            self._preview_item_id = None
 
     def _on_canvas_configure(self, _event: tk.Event[tk.Misc]) -> None:
         if self._resize_after_id is not None:
@@ -157,9 +188,11 @@ class OmokApp:
 
     def _handle_network_event(self, event: NetworkEvent) -> None:
         if event.kind == "connected":
+            self._clear_hover()
             self.state.connected = True
             self.message_var.set(event.message)
         elif event.kind == "disconnected":
+            self._clear_hover()
             self.state.connected = False
             self._restart_pending = False
             self.connect_button.configure(state="normal")
@@ -172,6 +205,16 @@ class OmokApp:
         elif event.kind == "connecting":
             self.message_var.set("Connecting...")
         elif event.kind == "message" and event.payload is not None:
+            if event.payload.get("type") in {
+                "joined",
+                "game_start",
+                "move_result",
+                "game_over",
+                "game_state",
+                "player_disconnected",
+                "restart",
+            }:
+                self._clear_hover()
             try:
                 change = self.state.apply_server_message(event.payload)
             except ValueError as exc:
@@ -211,8 +254,10 @@ class OmokApp:
     def _draw_board(self) -> None:
         geometry = self._geometry()
         self.canvas.delete("all")
+        self._preview_item_id = None
         self._draw_grid(geometry)
         self._draw_stones(geometry)
+        self._render_preview(geometry)
 
     def _draw_grid(self, geometry: BoardGeometry) -> None:
         for index in range(self.state.board_size):
@@ -274,10 +319,34 @@ class OmokApp:
             width=1,
         )
 
+    def _render_preview(self, geometry: BoardGeometry) -> None:
+        if self._preview_item_id is not None:
+            self.canvas.delete(self._preview_item_id)
+            self._preview_item_id = None
+        coordinate = self.hover_position
+        if coordinate is None or not self.state.can_move(*coordinate):
+            self.hover_position = None
+            return
+        cx, cy = geometry.board_to_pixel(*coordinate)
+        radius = geometry.stone_radius
+        outline = "#242424" if self.state.my_color == BLACK else "#FFFFFF"
+        self._preview_item_id = self.canvas.create_oval(
+            cx - radius,
+            cy - radius,
+            cx + radius,
+            cy + radius,
+            fill="",
+            outline=outline,
+            width=3,
+            dash=(6, 4),
+            tags=("preview",),
+        )
+
     def _on_close(self) -> None:
         if self._closing:
             return
         self._closing = True
+        self._clear_hover()
         if self._resize_after_id is not None:
             self.root.after_cancel(self._resize_after_id)
             self._resize_after_id = None

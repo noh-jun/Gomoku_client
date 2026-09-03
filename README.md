@@ -41,6 +41,13 @@ py -3.13 -m venv .venv
 .\.venv\Scripts\python.exe .\client\client.py
 ```
 
+Windows에서는 `client` 폴더의 실행 스크립트를 사용할 수도 있습니다. 클라이언트 전용 `.venv`가 있으면 우선 사용하고, 없으면 상위 폴더의 `.venv`를 자동으로 사용합니다.
+
+```powershell
+cd client
+.\run_client.cmd
+```
+
 두 클라이언트를 실행해 Server와 Room에 같은 값을 입력한 뒤 Connect를 누릅니다. 기본 접속 URL은 다음과 같이 조합됩니다.
 
 ```text
@@ -59,6 +66,7 @@ ws://127.0.0.1:8000/ws/abc123
 - Restart 버튼도 요청만 보내며, 서버의 `restart`가 도착해야 보드를 초기화합니다.
 - Canvas 크기와 논리 보드 크기를 분리하며, 창 크기가 바뀌면 동일한 `BoardGeometry`로 격자·돌·마지막 착수·클릭 좌표를 다시 계산합니다.
 - 서버가 전달한 크기에 따라 15×15와 19×19를 포함한 보드를 공통 계산식으로 렌더링합니다.
+- 내 차례의 빈 교차점에 마우스를 올리면 자신의 돌 색상과 대응하는 점선 윤곽 Preview Stone을 표시합니다. Hover와 Click은 동일한 `BoardGeometry.pixel_to_board()`와 착수 가능 조건을 공유하며 Hover만으로는 서버 메시지를 전송하지 않습니다.
 
 ## 프로토콜
 

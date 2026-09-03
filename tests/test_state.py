@@ -98,6 +98,18 @@ class AppStateTests(unittest.TestCase):
         self.assertEqual(state.winner, BLACK)
         self.assertFalse(state.can_move(7, 7))
 
+    def test_move_eligibility_covers_hover_and_click_conditions(self) -> None:
+        state = self.playing_state()
+        self.assertTrue(state.can_move(7, 7))
+        state.board[7][7] = WHITE
+        self.assertFalse(state.can_move(7, 7))
+        state.board[7][7] = None
+        state.current_turn = WHITE
+        self.assertFalse(state.can_move(7, 7))
+        state.current_turn = BLACK
+        state.connected = False
+        self.assertFalse(state.can_move(7, 7))
+
     def test_restart_preserves_current_board_size(self) -> None:
         state = self.playing_state(19)
         state.board[18][18] = BLACK
