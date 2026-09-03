@@ -1,0 +1,90 @@
+# Python WebSocket Online Omok Client
+
+Tkinter GUI와 `asyncio` WebSocket 통신을 분리한 온라인 오목 클라이언트입니다. 서버가 게임의 authoritative state와 보드 설정을 가지며, 클라이언트는 서버에서 받은 `board_size`, `move_result`, `game_state`, `restart`를 화면에 반영합니다.
+
+## 구조
+
+```text
+client/
+├── omok_client/
+│   ├── __init__.py
+│   ├── main.py       # 프로그램 진입 및 로깅
+│   ├── board.py      # 동적 BoardGeometry와 양방향 좌표 변환
+│   ├── protocol.py   # 클라이언트 JSON 인코딩/디코딩
+│   ├── gui.py        # Tkinter UI와 보드 렌더링
+│   ├── network.py    # 별도 스레드의 asyncio/WebSocket 루프
+│   └── state.py      # 서버 메시지 기반 AppState 변경
+├── tests/
+│   ├── test_gui.py
+│   ├── test_protocol.py
+│   └── test_state.py
+├── client.py
+├── requirements.txt
+└── README.md
+```
+
+## 실행 환경과 설치
+
+Python 3.11 이상을 권장합니다. PowerShell에서 클라이언트 전용 가상환경까지 `client/` 안에 만들려면 다음을 실행합니다.
+
+```powershell
+cd client
+py -3.13 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+.\.venv\Scripts\python.exe client.py
+```
+
+저장소 루트에 이미 만든 `.venv`를 계속 사용할 수도 있습니다.
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install -r .\client\requirements.txt
+.\.venv\Scripts\python.exe .\client\client.py
+```
+
+두 클라이언트를 실행해 Server와 Room에 같은 값을 입력한 뒤 Connect를 누릅니다. 기본 접속 URL은 다음과 같이 조합됩니다.
+
+```text
+ws://127.0.0.1:8000/ws/abc123
+```
+
+서버는 별도 실행되어 있어야 합니다. TLS 서버는 `wss://` 주소도 사용할 수 있습니다.
+
+## 동작 구조
+
+- 메인 스레드는 Tkinter `mainloop()`와 모든 위젯 변경을 담당합니다.
+- 네트워크 데몬 스레드는 전용 asyncio 이벤트 루프와 WebSocket을 담당합니다.
+- 네트워크 스레드는 `queue.Queue`에 이벤트를 넣고, GUI는 `root.after()`로 큐를 주기적으로 처리합니다.
+- GUI의 전송 요청은 `asyncio.run_coroutine_threadsafe()`로 네트워크 루프에 전달됩니다.
+- 클릭 시 로컬 보드를 먼저 변경하지 않습니다. 서버의 `move_result`가 도착해야 돌이 표시됩니다.
+- Restart 버튼도 요청만 보내며, 서버의 `restart`가 도착해야 보드를 초기화합니다.
+- Canvas 크기와 논리 보드 크기를 분리하며, 창 크기가 바뀌면 동일한 `BoardGeometry`로 격자·돌·마지막 착수·클릭 좌표를 다시 계산합니다.
+- 서버가 전달한 크기에 따라 15×15와 19×19를 포함한 보드를 공통 계산식으로 렌더링합니다.
+
+## 프로토콜
+
+Client → Server 메시지는 `move`, `restart_request`, `ping`을 사용합니다. Server → Client 메시지는 `joined`, `player_joined`, `game_start`, `move_result`, `game_over`, `game_state`, `player_disconnected`, `restart`, `error`, `pong`을 처리합니다.
+
+서버는 `joined`에 `board_size`와 `win_length`를 포함해야 하며, 동기화를 위해 `game_start`, `game_state`, `restart`에도 같은 필드를 포함할 수 있습니다. `game_state.board`는 `board_size`개의 행과 열을 가진 `board[y][x]` 배열이어야 하고 셀 값은 `"BLACK"`, `"WHITE"`, `null`입니다. 호환성을 위해 빈 셀의 `"EMPTY"`와 빈 문자열도 허용합니다. 구버전 서버가 설정 필드를 생략하면 15×15, 승리 길이 5의 현재 설정을 유지합니다.
+
+```json
+{
+  "type": "joined",
+  "room_id": "abc123",
+  "your_color": "BLACK",
+  "board_size": 19,
+  "win_length": 5
+}
+```
+
+클라이언트는 안전을 위해 `board_size` 5~50과 `win_length` 3~`board_size`만 허용합니다. 승리 판정은 여전히 서버 책임입니다.
+
+알 수 없는 메시지, 잘못된 JSON, 유효하지 않은 상태 메시지는 기록하고 화면 메시지로 표시하되 GUI를 종료하지 않습니다.
+
+## 테스트
+
+```powershell
+cd client
+.\.venv\Scripts\python.exe -m unittest discover -v
+```
+
+15×15/19×19 생성과 좌표 round trip, JSON 처리, `joined`, `game_start`, `move_result`, authoritative `game_state`, `game_over`, 크기를 유지하는 `restart`, 알 수 없는 메시지 및 잘못된 상태의 원자적 거부를 테스트합니다. 실제 서버 연동은 서버 구현과 함께 두 클라이언트로 확인해야 합니다.

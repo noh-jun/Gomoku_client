@@ -1,0 +1,137 @@
+from __future__ import annotations
+
+import asyncio
+from concurrent.futures import Future
+from dataclasses import dataclass
+import logging
+from queue import Queue
+import threading
+from typing import Any
+from urllib.parse import quote
+
+import websockets
+
+from .protocol import ClientProtocolError, decode_server_message, encode_message
+
+LOGGER = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class NetworkEvent:
+    kind: str
+    payload: dict[str, Any] | None = None
+    message: str = ""
+
+
+class NetworkClient:
+    """Owns a dedicated asyncio loop and never touches Tk widgets."""
+
+    def __init__(self, events: Queue[NetworkEvent]) -> None:
+        self.events = events
+        self._loop = asyncio.new_event_loop()
+        self._thread = threading.Thread(target=self._run_loop, name="omok-network", daemon=True)
+        self._thread.start()
+        self._session: Future[None] | None = None
+        self._websocket: Any = None
+        self._closing = False
+
+    def connect(self, server_url: str, room_id: str) -> bool:
+        if self._closing or (self._session is not None and not self._session.done()):
+            return False
+        server_url = server_url.strip().rstrip("/")
+        room_id = room_id.strip()
+        if not server_url.startswith(("ws://", "wss://")):
+            raise ValueError("Server address must start with ws:// or wss://")
+        if not room_id:
+            raise ValueError("Room ID is required.")
+        uri = f"{server_url}/ws/{quote(room_id, safe='')}"
+        self._session = asyncio.run_coroutine_threadsafe(self._connection_session(uri), self._loop)
+        return True
+
+    def disconnect(self) -> None:
+        if self._closing:
+            return
+        asyncio.run_coroutine_threadsafe(self._close_websocket(), self._loop)
+
+    def send_move(self, x: int, y: int) -> None:
+        self._submit_send(encode_message("move", x=x, y=y))
+
+    def request_restart(self) -> None:
+        self._submit_send(encode_message("restart_request"))
+
+    def ping(self) -> None:
+        self._submit_send(encode_message("ping"))
+
+    def shutdown(self, timeout: float = 3.0) -> None:
+        if self._closing:
+            return
+        self._closing = True
+        close_future = asyncio.run_coroutine_threadsafe(self._close_websocket(), self._loop)
+        try:
+            close_future.result(timeout=timeout)
+        except Exception as exc:
+            LOGGER.debug("WebSocket close during shutdown did not complete cleanly: %s", exc)
+        self._loop.call_soon_threadsafe(self._loop.stop)
+        self._thread.join(timeout=timeout)
+        LOGGER.info("Network client stopped")
+
+    def _run_loop(self) -> None:
+        asyncio.set_event_loop(self._loop)
+        self._loop.run_forever()
+        pending = asyncio.all_tasks(self._loop)
+        for task in pending:
+            task.cancel()
+        if pending:
+            self._loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+        self._loop.close()
+
+    async def _connection_session(self, uri: str) -> None:
+        self.events.put(NetworkEvent("connecting", message=f"Connecting to {uri}"))
+        try:
+            async with websockets.connect(uri, ping_interval=20, ping_timeout=20) as websocket:
+                self._websocket = websocket
+                LOGGER.info("Connected to %s", uri)
+                self.events.put(NetworkEvent("connected", message="Connected. Waiting for server..."))
+                async for raw in websocket:
+                    if not isinstance(raw, str):
+                        self.events.put(NetworkEvent("protocol_error", message="Ignored non-text server message."))
+                        continue
+                    try:
+                        payload = decode_server_message(raw)
+                    except ClientProtocolError as exc:
+                        LOGGER.warning("Invalid server message: %s", exc)
+                        self.events.put(NetworkEvent("protocol_error", message=str(exc)))
+                        continue
+                    LOGGER.info("Received %s", payload.get("type"))
+                    self.events.put(NetworkEvent("message", payload=payload))
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            LOGGER.warning("Connection ended: %s", exc)
+            self.events.put(NetworkEvent("network_error", message=f"Connection lost: {exc}"))
+        finally:
+            self._websocket = None
+            self.events.put(NetworkEvent("disconnected", message="Disconnected."))
+            LOGGER.info("Connection closed")
+
+    async def _send(self, raw: str) -> None:
+        websocket = self._websocket
+        if websocket is None:
+            self.events.put(NetworkEvent("network_error", message="Not connected."))
+            return
+        try:
+            await websocket.send(raw)
+            LOGGER.info("Sent %s", raw)
+        except Exception as exc:
+            LOGGER.warning("Send failed: %s", exc)
+            self.events.put(NetworkEvent("network_error", message=f"Send failed: {exc}"))
+
+    async def _close_websocket(self) -> None:
+        websocket = self._websocket
+        if websocket is not None:
+            await websocket.close()
+
+    def _submit_send(self, raw: str) -> None:
+        if self._closing:
+            return
+        asyncio.run_coroutine_threadsafe(self._send(raw), self._loop)
