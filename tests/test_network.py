@@ -1,6 +1,7 @@
 import json
 import unittest
 
+from omok_client.game_type import GameType
 from omok_client.network import NetworkClient, build_websocket_uri
 
 
@@ -19,7 +20,8 @@ class NetworkLobbyCommandTests(unittest.TestCase):
         client._submit_send = lambda raw: sent.append(json.loads(raw))  # type: ignore[method-assign]
 
         client.request_room_list()
-        client.create_room("친선 대국")
+        client.create_room("친선 대국", GameType.GOMOKU)
+        client.create_room("친선 오셀로", GameType.OTHELLO)
         client.join_room("room_001")
         client.leave_room()
 
@@ -27,11 +29,26 @@ class NetworkLobbyCommandTests(unittest.TestCase):
             sent,
             [
                 {"type": "get_room_list"},
-                {"type": "create_room", "room_name": "친선 대국"},
+                {
+                    "type": "create_room",
+                    "room_name": "친선 대국",
+                    "game_type": "GOMOKU",
+                },
+                {
+                    "type": "create_room",
+                    "room_name": "친선 오셀로",
+                    "game_type": "OTHELLO",
+                },
                 {"type": "join_room", "room_id": "room_001"},
                 {"type": "leave_room"},
             ],
         )
+
+    def test_create_room_rejects_unknown_game_type(self) -> None:
+        client = object.__new__(NetworkClient)
+        client._submit_send = lambda _raw: None  # type: ignore[method-assign]
+        with self.assertRaises(ValueError):
+            client.create_room("Invalid", "CHESS")  # type: ignore[arg-type]
 
 
 if __name__ == "__main__":

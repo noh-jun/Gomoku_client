@@ -1,6 +1,7 @@
 import unittest
 
 from omok_client.board import BoardGeometry
+from omok_client.board_renderer import OthelloBoardGeometry
 
 
 class BoardGeometryTests(unittest.TestCase):
@@ -38,6 +39,17 @@ class BoardGeometryTests(unittest.TestCase):
         x, y = geometry.board_to_pixel(7, 7)
         self.assertIsNone(
             geometry.pixel_to_board(x + geometry.spacing * 0.49, y + geometry.spacing * 0.49)
+        )
+
+    def test_othello_uses_cell_centers_and_cell_hit_testing(self) -> None:
+        geometry = OthelloBoardGeometry.calculate(8, 800, 700)
+        first_x, first_y = geometry.board_to_pixel(0, 0)
+        last_x, last_y = geometry.board_to_pixel(7, 7)
+        self.assertEqual(geometry.pixel_to_board(first_x, first_y), (0, 0))
+        self.assertEqual(geometry.pixel_to_board(last_x, last_y), (7, 7))
+        self.assertAlmostEqual(first_x - geometry.origin_x, geometry.spacing / 2)
+        self.assertIsNone(
+            geometry.pixel_to_board(geometry.end_x + 0.01, geometry.end_y - 1)
         )
 
 

@@ -10,6 +10,7 @@ from typing import Any
 
 import websockets
 
+from .game_type import GameType
 from .protocol import ClientProtocolError, decode_server_message, encode_message
 
 LOGGER = logging.getLogger(__name__)
@@ -59,8 +60,13 @@ class NetworkClient:
     def request_room_list(self) -> None:
         self._submit_send(encode_message("get_room_list"))
 
-    def create_room(self, room_name: str) -> None:
-        self._submit_send(encode_message("create_room", room_name=room_name))
+    def create_room(self, room_name: str, game_type: GameType) -> None:
+        game_type = GameType.from_wire(game_type)
+        self._submit_send(
+            encode_message(
+                "create_room", room_name=room_name, game_type=game_type.value
+            )
+        )
 
     def join_room(self, room_id: str) -> None:
         self._submit_send(encode_message("join_room", room_id=room_id))

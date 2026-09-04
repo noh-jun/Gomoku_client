@@ -293,39 +293,41 @@ class AppStateTests(unittest.TestCase):
         )
         self.assertEqual(draw_change.message, "무승부입니다.")
 
-    def test_forbidden_move_messages(self) -> None:
-        labels = {
-            "DOUBLE_THREE": "3-3 금수",
-            "DOUBLE_FOUR": "4-4 금수",
-            "OVERLINE": "장목 금수",
-        }
-        for forbidden_type, label in labels.items():
-            with self.subTest(forbidden_type=forbidden_type, result="loss"):
-                state = self.playing_state()
-                change = state.apply_server_message(
-                    {
-                        "type": "game_over",
-                        "winner": WHITE,
-                        "loser": BLACK,
-                        "reason": "forbidden_move",
-                        "forbidden_type": forbidden_type,
-                        "x": 7,
-                        "y": 7,
-                    }
-                )
-                self.assertEqual(change.message, f"{label}로 패배했습니다.")
-            with self.subTest(forbidden_type=forbidden_type, result="win"):
-                state = self.playing_state()
-                change = state.apply_server_message(
-                    {
-                        "type": "game_over",
-                        "winner": BLACK,
-                        "loser": WHITE,
-                        "reason": "forbidden_move",
-                        "forbidden_type": forbidden_type,
-                    }
-                )
-                self.assertEqual(change.message, f"상대방의 {label}로 승리했습니다.")
+    def test_no_forbidden_free_move_messages(self) -> None:
+        loss = self.playing_state().apply_server_message(
+            {
+                "type": "game_over",
+                "winner": WHITE,
+                "loser": BLACK,
+                "reason": "no_forbidden_free_move",
+            }
+        )
+        self.assertEqual(loss.message, "둘 수 있는 자리가 모두 금수여서 패배했습니다.")
+
+        win = self.playing_state().apply_server_message(
+            {
+                "type": "game_over",
+                "winner": BLACK,
+                "loser": WHITE,
+                "reason": "no_forbidden_free_move",
+            }
+        )
+        self.assertEqual(
+            win.message, "상대가 둘 수 있는 자리가 모두 금수여서 승리했습니다."
+        )
+
+        watcher = AppState(view_state=IN_ROOM, connected=True, game_status="PLAYING")
+        neutral = watcher.apply_server_message(
+            {
+                "type": "game_over",
+                "winner": BLACK,
+                "loser": WHITE,
+                "reason": "no_forbidden_free_move",
+            }
+        )
+        self.assertEqual(
+            neutral.message, "둘 수 있는 자리가 모두 금수여서 게임이 종료되었습니다."
+        )
 
     def test_move_eligibility_covers_hover_and_click_conditions(self) -> None:
         state = self.playing_state()
@@ -356,8 +358,7 @@ class AppStateTests(unittest.TestCase):
                 "type": "game_over",
                 "winner": WHITE,
                 "loser": BLACK,
-                "reason": "forbidden_move",
-                "forbidden_type": "DOUBLE_THREE",
+                "reason": "five_in_a_row",
             }
         )
         state.apply_server_message(
@@ -376,7 +377,9 @@ class AppStateTests(unittest.TestCase):
         self.assertIsNone(state.winner)
         self.assertIsNone(state.loser)
         self.assertIsNone(state.game_over_reason)
-        self.assertIsNone(state.forbidden_type)
+        self.assertIsNone(state.constrained_color)
+        self.assertEqual(state.forbidden_moves, {})
+        self.assertIsNone(state.rejected_point)
         self.assertTrue(state.can_move(18, 18))
 
     def test_finished_game_state_restores_result(self) -> None:
@@ -395,7 +398,6 @@ class AppStateTests(unittest.TestCase):
                 "loser": BLACK,
                 "status": "FINISHED",
                 "game_over_reason": "five_in_a_row",
-                "forbidden_type": None,
             }
         )
         self.assertTrue(state.is_finished)
@@ -461,6 +463,202 @@ class AppStateTests(unittest.TestCase):
                 {"type": "joined", "room_id": "bad", "your_color": BLACK, "board_size": 500}
             )
         self.assertEqual(state.board_size, 15)
+
+    # ------------------------------------------------------------------
+    # Renju forbidden points (blocked, not an instant loss)
+    # ------------------------------------------------------------------
+    def gomoku_game_state(self, **overrides: object) -> dict[str, object]:
+        payload: dict[str, object] = {
+            "type": "game_state",
+            "board_size": 15,
+            "win_length": 5,
+            "board": new_board(15),
+            "current_turn": BLACK,
+            "winner": None,
+            "status": "PLAYING",
+            "constrained_color": BLACK,
+            "forbidden_moves": [
+                {"x": 3, "y": 4, "forbidden_type": "DOUBLE_THREE"},
+                {"x": 9, "y": 6, "forbidden_type": "OVERLINE"},
+            ],
+        }
+        payload.update(overrides)
+        return payload
+
+    def test_game_state_parses_forbidden_moves_and_constrained_color(self) -> None:
+        state = self.playing_state()
+        state.apply_server_message(self.gomoku_game_state())
+        self.assertEqual(state.constrained_color, BLACK)
+        self.assertEqual(
+            state.forbidden_moves,
+            {(3, 4): "DOUBLE_THREE", (9, 6): "OVERLINE"},
+        )
+
+    def test_free_style_game_state_has_no_constraint(self) -> None:
+        state = self.playing_state()
+        state.apply_server_message(self.gomoku_game_state())
+        state.apply_server_message(
+            self.gomoku_game_state(constrained_color=None, forbidden_moves=[])
+        )
+        self.assertIsNone(state.constrained_color)
+        self.assertEqual(state.forbidden_moves, {})
+
+    def test_game_state_without_forbidden_fields_is_accepted(self) -> None:
+        state = self.playing_state()
+        payload = self.gomoku_game_state()
+        del payload["constrained_color"]
+        del payload["forbidden_moves"]
+        state.apply_server_message(payload)
+        self.assertIsNone(state.constrained_color)
+        self.assertEqual(state.forbidden_moves, {})
+
+    def test_invalid_forbidden_moves_are_rejected_atomically(self) -> None:
+        occupied = new_board(15)
+        occupied[4][3] = WHITE
+        invalid_payloads = (
+            self.gomoku_game_state(
+                forbidden_moves=[{"x": 15, "y": 4, "forbidden_type": "DOUBLE_THREE"}]
+            ),
+            self.gomoku_game_state(
+                forbidden_moves=[{"x": 3, "y": 4, "forbidden_type": "DOUBLE_FIVE"}]
+            ),
+            self.gomoku_game_state(
+                board=occupied,
+                forbidden_moves=[{"x": 3, "y": 4, "forbidden_type": "DOUBLE_THREE"}],
+            ),
+            self.gomoku_game_state(forbidden_moves={"x": 3, "y": 4}),
+        )
+        for payload in invalid_payloads:
+            with self.subTest(forbidden_moves=payload["forbidden_moves"]):
+                state = self.playing_state()
+                state.apply_server_message(self.gomoku_game_state())
+                before = dict(state.forbidden_moves)
+                with self.assertRaises(ValueError):
+                    state.apply_server_message(payload)
+                self.assertEqual(state.forbidden_moves, before)
+
+    def test_finished_game_state_clears_forbidden_moves(self) -> None:
+        state = self.playing_state()
+        state.apply_server_message(
+            self.gomoku_game_state(
+                status="FINISHED",
+                current_turn=None,
+                winner=BLACK,
+                loser=WHITE,
+                game_over_reason="five_in_a_row",
+            )
+        )
+        self.assertEqual(state.forbidden_moves, {})
+
+    def test_can_move_blocks_forbidden_points_of_my_own_color(self) -> None:
+        state = self.playing_state()
+        state.apply_server_message(self.gomoku_game_state())
+        self.assertFalse(state.can_move(3, 4))
+        self.assertTrue(state.is_forbidden_for_me(3, 4))
+        self.assertEqual(state.forbidden_label_at(3, 4), "3-3 금수")
+        self.assertTrue(state.can_move(5, 5))
+
+    def test_can_move_ignores_forbidden_points_of_the_other_color(self) -> None:
+        state = self.playing_state()
+        state.apply_server_message(self.gomoku_game_state(constrained_color=WHITE))
+        self.assertTrue(state.can_move(3, 4))
+        self.assertFalse(state.is_forbidden_for_me(3, 4))
+
+    def test_forbidden_move_error_reports_label_and_point(self) -> None:
+        state = self.playing_state()
+        change = state.apply_server_message(
+            {
+                "type": "error",
+                "code": "FORBIDDEN_MOVE",
+                "forbidden_type": "DOUBLE_FOUR",
+                "x": 3,
+                "y": 4,
+            }
+        )
+        self.assertEqual(change.message, "4-4 금수 자리입니다. 다른 곳에 두세요.")
+        self.assertTrue(change.redraw_board)
+        self.assertEqual(state.rejected_point, (3, 4))
+
+    def test_forbidden_move_error_without_usable_point(self) -> None:
+        for payload in (
+            {"type": "error", "code": "FORBIDDEN_MOVE", "forbidden_type": "OVERLINE"},
+            {
+                "type": "error",
+                "code": "FORBIDDEN_MOVE",
+                "forbidden_type": "OVERLINE",
+                "x": 99,
+                "y": 4,
+            },
+            {
+                "type": "error",
+                "code": "FORBIDDEN_MOVE",
+                "forbidden_type": "OVERLINE",
+                "x": True,
+                "y": 4,
+            },
+        ):
+            with self.subTest(payload=payload):
+                state = self.playing_state()
+                change = state.apply_server_message(payload)
+                self.assertEqual(
+                    change.message, "장목 금수 자리입니다. 다른 곳에 두세요."
+                )
+                self.assertIsNone(state.rejected_point)
+
+    def test_rejected_point_is_cleared_by_later_messages(self) -> None:
+        rejection = {
+            "type": "error",
+            "code": "FORBIDDEN_MOVE",
+            "forbidden_type": "DOUBLE_THREE",
+            "x": 3,
+            "y": 4,
+        }
+        follow_ups = (
+            {"type": "move_result", "x": 7, "y": 7, "color": BLACK, "next_turn": WHITE},
+            {"type": "restart", "current_turn": BLACK},
+            {"type": "game_over", "winner": BLACK, "loser": WHITE, "reason": "five_in_a_row"},
+        )
+        for follow_up in follow_ups:
+            with self.subTest(follow_up=follow_up["type"]):
+                state = self.playing_state()
+                state.apply_server_message(rejection)
+                self.assertEqual(state.rejected_point, (3, 4))
+                state.apply_server_message(follow_up)
+                self.assertIsNone(state.rejected_point)
+
+    def test_game_state_keeps_the_last_move_marker(self) -> None:
+        state = self.playing_state()
+        state.apply_server_message(
+            {"type": "move_result", "x": 7, "y": 7, "color": BLACK, "next_turn": WHITE}
+        )
+        self.assertEqual(state.last_move, (7, 7))
+        board = new_board(15)
+        board[7][7] = BLACK
+        state.apply_server_message(
+            self.gomoku_game_state(
+                board=board, current_turn=WHITE, last_move={"x": 7, "y": 7}
+            )
+        )
+        self.assertEqual(state.last_move, (7, 7))
+        state.apply_server_message(self.gomoku_game_state(board=board, last_move=None))
+        self.assertIsNone(state.last_move)
+
+    def test_reset_room_state_clears_forbidden_tracking(self) -> None:
+        state = self.playing_state()
+        state.apply_server_message(self.gomoku_game_state())
+        state.apply_server_message(
+            {
+                "type": "error",
+                "code": "FORBIDDEN_MOVE",
+                "forbidden_type": "DOUBLE_THREE",
+                "x": 3,
+                "y": 4,
+            }
+        )
+        state.reset_room_state()
+        self.assertIsNone(state.constrained_color)
+        self.assertEqual(state.forbidden_moves, {})
+        self.assertIsNone(state.rejected_point)
 
 
 if __name__ == "__main__":

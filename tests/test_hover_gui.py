@@ -6,6 +6,7 @@ from tkinter import ttk
 import unittest
 
 from omok_client.gui import OmokApp
+from omok_client.game_type import GameType
 from omok_client.network import NetworkEvent
 from omok_client.state import AppState, BLACK, IN_ROOM, WHITE
 
@@ -244,10 +245,15 @@ class HoverGuiTests(unittest.TestCase):
 
     def test_create_room_suppresses_duplicate_clicks_until_joined_or_error(self) -> None:
         self.enter_lobby()
-        requests: list[str] = []
-        self.app.network.create_room = requests.append
+        requests: list[tuple[str, GameType]] = []
+        self.app.network.create_room = lambda name, game_type: requests.append(
+            (name, game_type)
+        )
         self.app._create_room()
         self.assertTrue(self.app._create_room_modal_open)
+        self.assertEqual(
+            self.app._create_room_game_type_var.get(), GameType.GOMOKU.value
+        )
         self.assertEqual(self.app.create_room_modal_canvas.winfo_manager(), "place")
         self.assertEqual(self.app.create_room_modal_canvas.winfo_class(), "Canvas")
         self.assertEqual(str(self.app.refresh_rooms_button["state"]), "disabled")
@@ -262,7 +268,7 @@ class HoverGuiTests(unittest.TestCase):
 
         self.app._create_room_name_var.set("  친선 대국  ")
         self.app._submit_create_room()
-        self.assertEqual(requests, ["친선 대국"])
+        self.assertEqual(requests, [("친선 대국", GameType.GOMOKU)])
         self.assertFalse(self.app._create_room_modal_open)
         self.assertEqual(self.app.create_room_modal_canvas.winfo_manager(), "")
         self.assertTrue(self.app._room_request_pending)
@@ -281,12 +287,142 @@ class HoverGuiTests(unittest.TestCase):
         self.assertFalse(self.app._room_request_pending)
         self.assertEqual(self.app.state.view_state, "LOBBY")
 
+    def test_create_othello_room_and_render_othello_card(self) -> None:
+        self.app._handle_network_event(NetworkEvent("connected", message="Connected."))
+        self.app.network.request_room_list = lambda: None
+        self.app._handle_network_event(
+            NetworkEvent(
+                "message",
+                payload={
+                    "type": "connected",
+                    "supported_game_types": ["GOMOKU", "OTHELLO"],
+                },
+            )
+        )
+        requests: list[tuple[str, GameType]] = []
+        self.app.network.create_room = lambda name, game_type: requests.append(
+            (name, game_type)
+        )
+        self.app._create_room()
+        self.app._create_room_name_var.set("친선 오셀로")
+        self.app._create_room_game_type_var.set(GameType.OTHELLO.value)
+        self.app._submit_create_room()
+        self.assertEqual(requests, [("친선 오셀로", GameType.OTHELLO)])
+
+        self.app._room_request_pending = False
+        self.app._handle_network_event(
+            NetworkEvent(
+                "message",
+                payload={
+                    "type": "room_list",
+                    "rooms": [
+                        {
+                            "room_id": "room_002",
+                            "room_name": "친선 오셀로",
+                            "game_type": "OTHELLO",
+                            "board_size": 8,
+                            "win_length": None,
+                            "players": 1,
+                            "max_players": 2,
+                            "status": "WAITING",
+                        }
+                    ],
+                },
+            )
+        )
+        self.assertIn("Othello · 8 × 8", str(self.app.room_cards["room_002"]["text"]))
+
+    def test_othello_uses_cell_renderer_legal_moves_score_and_pending(self) -> None:
+        board = [[None for _ in range(8)] for _ in range(8)]
+        board[3][3] = WHITE
+        board[3][4] = BLACK
+        board[4][3] = BLACK
+        board[4][4] = WHITE
+        self.app.state = AppState(
+            view_state=IN_ROOM,
+            game_type=GameType.OTHELLO,
+            my_color=BLACK,
+            starting_color=BLACK,
+            board_size=8,
+            win_length=None,
+            board=board,
+            current_turn=BLACK,
+            game_status="PLAYING",
+            connected=True,
+            legal_moves={(2, 3)},
+            score={BLACK: 2, WHITE: 2},
+        )
+        self.app._render_status()
+        self.app._draw_board()
+        self.assertEqual(self.app.game_type_var.get(), "Othello")
+        self.assertEqual(self.app.score_var.get(), "Score: Black 2 · White 2")
+        self.assertEqual(len(self.app.canvas.find_withtag("legal_move")), 1)
+        self.assertEqual(str(self.app.canvas["background"]), "#2E7D32")
+
+        legal_x, legal_y = self.app._geometry().board_to_pixel(2, 3)
+        legal_event = SimpleNamespace(x=legal_x, y=legal_y)
+        self.app._on_mouse_move(legal_event)  # type: ignore[arg-type]
+        self.assertEqual(self.app.hover_position, (2, 3))
+        sent: list[tuple[int, int]] = []
+        self.app.network.send_move = lambda x, y: sent.append((x, y))
+        self.app._on_board_click(legal_event)  # type: ignore[arg-type]
+        self.app._on_board_click(legal_event)  # type: ignore[arg-type]
+        self.assertEqual(sent, [(2, 3)])
+        self.assertTrue(self.app._move_pending)
+
+        self.app._handle_network_event(
+            NetworkEvent(
+                "message",
+                payload={
+                    "type": "move_result",
+                    "game_type": "OTHELLO",
+                    "x": 2,
+                    "y": 3,
+                    "color": BLACK,
+                    "flipped": [{"x": 3, "y": 3, "color": BLACK}],
+                    "passed_color": WHITE,
+                    "next_turn": BLACK,
+                },
+            )
+        )
+        self.assertFalse(self.app._move_pending)
+        self.assertIn("White has no legal move", self.app.message_var.get())
+        nonlegal_x, nonlegal_y = self.app._geometry().board_to_pixel(0, 0)
+        self.app._on_mouse_move(
+            SimpleNamespace(x=nonlegal_x, y=nonlegal_y)  # type: ignore[arg-type]
+        )
+        self.assertIsNone(self.app.hover_position)
+
+        self.app._handle_network_event(
+            NetworkEvent(
+                "message",
+                payload={
+                    "type": "game_over",
+                    "game_type": "OTHELLO",
+                    "winner": BLACK,
+                    "loser": WHITE,
+                    "reason": "no_legal_moves",
+                    "score": {BLACK: 35, WHITE: 29},
+                },
+            )
+        )
+        overlay_text = next(
+            item
+            for item in self.app.canvas.find_withtag("result_overlay")
+            if self.app.canvas.type(item) == "text"
+        )
+        self.assertEqual(
+            self.app.canvas.itemcget(overlay_text, "text"),
+            "You Win\nBlack 35 · White 29",
+        )
+
     def test_hover_and_click_share_coordinates_for_15_and_19(self) -> None:
         for board_size, coordinate, color in (
             (15, (7, 7), BLACK),
             (19, (18, 18), WHITE),
         ):
             with self.subTest(board_size=board_size):
+                self.app._move_pending = False
                 self.app.state = AppState(
                     view_state=IN_ROOM,
                     my_color=color,
@@ -410,8 +546,7 @@ class HoverGuiTests(unittest.TestCase):
                     "type": "game_over",
                     "winner": WHITE,
                     "loser": BLACK,
-                    "reason": "forbidden_move",
-                    "forbidden_type": "DOUBLE_THREE",
+                    "reason": "no_forbidden_free_move",
                 },
             )
         )
@@ -421,7 +556,9 @@ class HoverGuiTests(unittest.TestCase):
         self.assertEqual(
             label_image_name(self.app.turn_stone_label), str(self.app._stone_images[None])
         )
-        self.assertEqual(self.app.message_var.get(), "3-3 금수로 패배했습니다.")
+        self.assertEqual(
+            self.app.message_var.get(), "둘 수 있는 자리가 모두 금수여서 패배했습니다."
+        )
         self.assertEqual(str(self.app.restart_button["state"]), "normal")
         overlay_items = self.app.canvas.find_withtag("result_overlay")
         self.assertEqual(len(overlay_items), 2)
@@ -429,7 +566,8 @@ class HoverGuiTests(unittest.TestCase):
             item for item in overlay_items if self.app.canvas.type(item) == "text"
         )
         self.assertEqual(
-            self.app.canvas.itemcget(overlay_text, "text"), "3-3 금수로 패배했습니다."
+            self.app.canvas.itemcget(overlay_text, "text"),
+            "둘 수 있는 자리가 모두 금수여서 패배했습니다.",
         )
 
         self.app._handle_network_event(
@@ -457,6 +595,138 @@ class HoverGuiTests(unittest.TestCase):
         self.assertEqual(
             self.app.canvas.itemcget(self.app._preview_item_id, "outline"), "#FFFFFF"
         )
+
+    # ------------------------------------------------------------------
+    # Renju forbidden points
+    # ------------------------------------------------------------------
+    def forbidden_state(self, constrained: str | None = BLACK) -> AppState:
+        state = AppState(
+            view_state=IN_ROOM,
+            my_color=BLACK,
+            current_turn=BLACK,
+            game_status="PLAYING",
+            connected=True,
+        )
+        state.constrained_color = constrained
+        state.forbidden_moves = {(3, 4): "DOUBLE_THREE", (9, 6): "OVERLINE"}
+        return state
+
+    def board_event(self, x: int, y: int) -> SimpleNamespace:
+        pixel_x, pixel_y = self.app._geometry().board_to_pixel(x, y)
+        return SimpleNamespace(x=pixel_x, y=pixel_y)
+
+    def test_forbidden_markers_are_drawn_for_the_constrained_player(self) -> None:
+        self.app.state = self.forbidden_state()
+        self.app._draw_board()
+        self.assertEqual(len(self.app.canvas.find_withtag("forbidden_move")), 4)
+
+    def test_forbidden_markers_are_hidden_from_the_other_player(self) -> None:
+        self.app.state = self.forbidden_state(constrained=WHITE)
+        self.app._draw_board()
+        self.assertEqual(self.app.canvas.find_withtag("forbidden_move"), ())
+
+    def test_forbidden_markers_are_hidden_on_an_othello_board(self) -> None:
+        state = AppState(
+            view_state=IN_ROOM,
+            my_color=BLACK,
+            current_turn=BLACK,
+            game_status="PLAYING",
+            connected=True,
+            game_type=GameType.OTHELLO,
+            board_size=8,
+            win_length=None,
+        )
+        state.constrained_color = BLACK
+        state.forbidden_moves = {(3, 4): "DOUBLE_THREE"}
+        self.app.state = state
+        self.app._draw_board()
+        self.assertEqual(self.app.canvas.find_withtag("forbidden_move"), ())
+
+    def test_forbidden_markers_are_hidden_once_the_game_is_finished(self) -> None:
+        state = self.forbidden_state()
+        state.game_status = "FINISHED"
+        self.app.state = state
+        self.app._draw_board()
+        self.assertEqual(self.app.canvas.find_withtag("forbidden_move"), ())
+
+    def test_hover_preview_skips_forbidden_points(self) -> None:
+        self.app.state = self.forbidden_state()
+        self.app._draw_board()
+        self.app._on_mouse_move(self.board_event(3, 4))  # type: ignore[arg-type]
+        self.assertIsNone(self.app.hover_position)
+        self.assertIsNone(self.app._preview_item_id)
+
+        self.app._on_mouse_move(self.board_event(5, 5))  # type: ignore[arg-type]
+        self.assertEqual(self.app.hover_position, (5, 5))
+        self.assertIsNotNone(self.app._preview_item_id)
+
+    def test_clicking_a_forbidden_point_sends_nothing_and_explains_why(self) -> None:
+        sent: list[tuple[int, int]] = []
+        self.app.network.send_move = lambda x, y: sent.append((x, y))
+        self.app.state = self.forbidden_state()
+        self.app._draw_board()
+        self.app._on_board_click(self.board_event(3, 4))  # type: ignore[arg-type]
+        self.assertEqual(sent, [])
+        self.assertFalse(self.app._move_pending)
+        self.assertEqual(
+            self.app.message_var.get(), "3-3 금수 자리입니다. 다른 곳에 두세요."
+        )
+
+    def test_server_rejection_highlights_the_point_and_unlocks_input(self) -> None:
+        sent: list[tuple[int, int]] = []
+        self.app.network.send_move = lambda x, y: sent.append((x, y))
+        self.app.state = self.forbidden_state()
+        self.app._draw_board()
+
+        # A point the local list does not know about yet: the client is one
+        # game_state behind, so the move leaves and the server rejects it.
+        self.app._on_board_click(self.board_event(5, 5))  # type: ignore[arg-type]
+        self.assertEqual(sent, [(5, 5)])
+        self.assertTrue(self.app._move_pending)
+
+        self.app._handle_network_event(
+            NetworkEvent(
+                "message",
+                payload={
+                    "type": "error",
+                    "code": "FORBIDDEN_MOVE",
+                    "forbidden_type": "DOUBLE_FOUR",
+                    "x": 5,
+                    "y": 5,
+                },
+            )
+        )
+        self.assertFalse(self.app._move_pending)
+        self.assertEqual(self.app.state.rejected_point, (5, 5))
+        self.assertEqual(
+            self.app.message_var.get(), "4-4 금수 자리입니다. 다른 곳에 두세요."
+        )
+        self.assertEqual(len(self.app.canvas.find_withtag("forbidden_rejected")), 1)
+        self.assertIsNotNone(self.app._forbidden_flash_after_id)
+
+        self.app._on_board_click(self.board_event(6, 6))  # type: ignore[arg-type]
+        self.assertEqual(sent, [(5, 5), (6, 6)])
+
+    def test_rejection_highlight_disappears_after_the_flash(self) -> None:
+        self.app.state = self.forbidden_state()
+        self.app._handle_network_event(
+            NetworkEvent(
+                "message",
+                payload={
+                    "type": "error",
+                    "code": "FORBIDDEN_MOVE",
+                    "forbidden_type": "OVERLINE",
+                    "x": 5,
+                    "y": 5,
+                },
+            )
+        )
+        self.assertEqual(len(self.app.canvas.find_withtag("forbidden_rejected")), 1)
+
+        self.app._clear_rejected_point()
+        self.assertIsNone(self.app.state.rejected_point)
+        self.assertIsNone(self.app._forbidden_flash_after_id)
+        self.assertEqual(self.app.canvas.find_withtag("forbidden_rejected"), ())
 
 
 if __name__ == "__main__":
