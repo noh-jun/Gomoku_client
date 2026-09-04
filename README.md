@@ -55,6 +55,12 @@ cd client
 .\run_client.cmd
 ```
 
+macOS에서는 더블클릭으로 실행할 수 있는 앱 번들을 만들 수 있습니다. 자세한 내용은 [macos/README.md](macos/README.md)를 참고하세요.
+
+```bash
+bash macos/build_app.sh
+```
+
 클라이언트를 실행해 Server 주소로 연결하면 Lobby가 열립니다. Room ID를 직접 입력하지 않고 서버가 제공한 Room 목록에서 선택하거나 새 Room을 만듭니다. 기본 접속 URL은 다음과 같습니다.
 
 ```text
