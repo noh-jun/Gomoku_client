@@ -7,13 +7,19 @@ import logging
 from queue import Queue
 import threading
 from typing import Any
-from urllib.parse import quote
 
 import websockets
 
 from .protocol import ClientProtocolError, decode_server_message, encode_message
 
 LOGGER = logging.getLogger(__name__)
+
+
+def build_websocket_uri(server_url: str) -> str:
+    server_url = server_url.strip().rstrip("/")
+    if not server_url.startswith(("ws://", "wss://")):
+        raise ValueError("Server address must start with ws:// or wss://")
+    return f"{server_url}/ws"
 
 
 @dataclass(frozen=True)
@@ -35,16 +41,10 @@ class NetworkClient:
         self._websocket: Any = None
         self._closing = False
 
-    def connect(self, server_url: str, room_id: str) -> bool:
+    def connect(self, server_url: str) -> bool:
         if self._closing or (self._session is not None and not self._session.done()):
             return False
-        server_url = server_url.strip().rstrip("/")
-        room_id = room_id.strip()
-        if not server_url.startswith(("ws://", "wss://")):
-            raise ValueError("Server address must start with ws:// or wss://")
-        if not room_id:
-            raise ValueError("Room ID is required.")
-        uri = f"{server_url}/ws/{quote(room_id, safe='')}"
+        uri = build_websocket_uri(server_url)
         self._session = asyncio.run_coroutine_threadsafe(self._connection_session(uri), self._loop)
         return True
 
@@ -55,6 +55,18 @@ class NetworkClient:
 
     def send_move(self, x: int, y: int) -> None:
         self._submit_send(encode_message("move", x=x, y=y))
+
+    def request_room_list(self) -> None:
+        self._submit_send(encode_message("get_room_list"))
+
+    def create_room(self, room_name: str) -> None:
+        self._submit_send(encode_message("create_room", room_name=room_name))
+
+    def join_room(self, room_id: str) -> None:
+        self._submit_send(encode_message("join_room", room_id=room_id))
+
+    def leave_room(self) -> None:
+        self._submit_send(encode_message("leave_room"))
 
     def request_restart(self) -> None:
         self._submit_send(encode_message("restart_request"))

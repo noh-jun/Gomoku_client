@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+from .room_name import normalize_room_name
+
 DEFAULT_BOARD_SIZE = 15
 DEFAULT_WIN_LENGTH = 5
 MIN_BOARD_SIZE = 5
@@ -12,6 +14,9 @@ EMPTY = None
 BLACK = "BLACK"
 WHITE = "WHITE"
 VALID_COLORS = {BLACK, WHITE}
+DISCONNECTED = "DISCONNECTED"
+LOBBY = "LOBBY"
+IN_ROOM = "IN_ROOM"
 FORBIDDEN_LABELS = {
     "DOUBLE_THREE": "3-3 금수",
     "DOUBLE_FOUR": "4-4 금수",
@@ -31,9 +36,26 @@ class StateChange:
     redraw_board: bool = False
 
 
+@dataclass(frozen=True)
+class RoomSummary:
+    room_id: str
+    room_name: str
+    board_size: int
+    players: int
+    max_players: int
+    status: str
+
+    @property
+    def can_join(self) -> bool:
+        return self.players < self.max_players and self.status == "WAITING"
+
+
 @dataclass
 class AppState:
+    view_state: str = DISCONNECTED
     room_id: str | None = None
+    room_name: str | None = None
+    rooms: list[RoomSummary] = field(default_factory=list)
     my_color: str | None = None
     starting_color: str | None = None
     board_size: int = DEFAULT_BOARD_SIZE
@@ -67,9 +89,32 @@ class AppState:
             self.last_move = None
         return size_changed
 
+    def reset_room_state(self) -> None:
+        self.view_state = LOBBY if self.connected else DISCONNECTED
+        self.room_id = None
+        self.room_name = None
+        self.my_color = None
+        self.starting_color = None
+        self.board_size = DEFAULT_BOARD_SIZE
+        self.win_length = DEFAULT_WIN_LENGTH
+        self.board = new_board(self.board_size)
+        self.current_turn = None
+        self.game_status = LOBBY if self.connected else DISCONNECTED
+        self.winner = None
+        self.loser = None
+        self.game_over_reason = None
+        self.forbidden_type = None
+        self.last_move = None
+
+    def reset_connection(self) -> None:
+        self.connected = False
+        self.rooms = []
+        self.reset_room_state()
+
     def can_move(self, x: int, y: int) -> bool:
         return (
             self.connected
+            and self.view_state == IN_ROOM
             and self.game_status == "PLAYING"
             and self.my_color is not None
             and self.current_turn == self.my_color
@@ -85,6 +130,25 @@ class AppState:
     def apply_server_message(self, data: dict[str, Any]) -> StateChange:
         message_type = data.get("type")
 
+        if message_type == "connected":
+            self.connected = True
+            self.reset_room_state()
+            return StateChange(True, "Lobby connected.")
+
+        if message_type == "room_list":
+            rooms = _validated_rooms(data.get("rooms"))
+            self.rooms = rooms
+            return StateChange(True, f"Room list updated ({len(rooms)}).")
+
+        if message_type == "room_created":
+            room_id = data.get("room_id")
+            if not isinstance(room_id, str) or not room_id:
+                raise ValueError("room_created.room_id must be a non-empty string")
+            room_name = _room_name_from_message(data, room_id)
+            return StateChange(
+                True, f"Room {room_name} created. Waiting for join confirmation..."
+            )
+
         if message_type == "joined":
             color = _required_color(data, "your_color")
             starting_color = _optional_color(data, "starting_color", self.starting_color)
@@ -93,6 +157,8 @@ class AppState:
                 raise ValueError("joined.room_id must be a string")
             board_size, win_length = _settings_from_message(data, self.board_size, self.win_length)
             self.room_id = room_id
+            self.room_name = _room_name_from_message(data, room_id)
+            self.view_state = IN_ROOM
             self.my_color = color
             self.starting_color = starting_color
             self.board_size = board_size
@@ -102,23 +168,34 @@ class AppState:
             self.game_status = "WAITING"
             return StateChange(True, "Waiting for opponent...", True)
 
+        if message_type == "left_room":
+            room_id = data.get("room_id")
+            if room_id is not None and not isinstance(room_id, str):
+                raise ValueError("left_room.room_id must be a string or null")
+            self.reset_room_state()
+            return StateChange(True, "Returned to lobby.", True)
+
         if message_type == "player_joined":
             color = _required_color(data, "color")
             return StateChange(True, f"{color.title()} player joined. Waiting for game start...")
 
         if message_type == "game_start":
             current_turn = _required_color(data, "current_turn")
+            my_color = _optional_color(data, "your_color", self.my_color)
             starting_color = _optional_color(data, "starting_color", current_turn)
             board_size, win_length = _settings_from_message(data, self.board_size, self.win_length)
-            redraw = self.apply_board_settings(board_size, win_length)
+            self.apply_board_settings(board_size, win_length)
+            self.board = new_board(board_size)
+            self.last_move = None
             self.current_turn = current_turn
+            self.my_color = my_color
             self.starting_color = starting_color
             self.game_status = "PLAYING"
             self.winner = None
             self.loser = None
             self.game_over_reason = None
             self.forbidden_type = None
-            return StateChange(True, self.turn_message(), redraw)
+            return StateChange(True, self.turn_message(), True)
 
         if message_type == "move_result":
             x = _required_coordinate(data, "x", self.board_size)
@@ -143,7 +220,7 @@ class AppState:
             self.forbidden_type = forbidden_type
             self.game_status = "FINISHED"
             self.current_turn = None
-            return StateChange(True, self.build_game_over_message())
+            return StateChange(True, self.build_game_over_message(), True)
 
         if message_type == "game_state":
             board_size, win_length = _settings_from_message(data, self.board_size, self.win_length)
@@ -181,7 +258,13 @@ class AppState:
 
         if message_type == "player_disconnected":
             color = _required_color(data, "color")
-            return StateChange(True, f"{color.title()} player disconnected.")
+            self.current_turn = None
+            self.game_status = "WAITING"
+            self.winner = None
+            self.loser = None
+            self.game_over_reason = None
+            self.forbidden_type = None
+            return StateChange(True, f"{color.title()} player left. Waiting for opponent...")
 
         if message_type == "restart":
             current_turn = _required_color(data, "current_turn")
@@ -207,7 +290,16 @@ class AppState:
             code = data.get("code")
             detail = text if isinstance(text, str) else "The server reported an error."
             if isinstance(code, str):
-                detail = f"{detail} [{code}]"
+                localized = {
+                    "ROOM_FULL": "선택한 방이 가득 찼습니다.",
+                    "ROOM_NOT_FOUND": "선택한 방이 더 이상 존재하지 않습니다.",
+                    "NOT_IN_ROOM": "현재 입장한 방이 없습니다.",
+                    "ALREADY_IN_ROOM": "이미 다른 방에 입장해 있습니다.",
+                    "INVALID_ROOM_NAME": "사용할 수 없는 방 이름입니다.",
+                    "ROOM_NAME_TAKEN": "이미 사용 중인 방 이름입니다.",
+                    "CREATE_ROOM_FAILED": "방을 생성하지 못했습니다.",
+                }
+                detail = localized.get(code, f"{detail} [{code}]")
             return StateChange(True, detail)
 
         if message_type == "pong":
@@ -328,3 +420,59 @@ def _validated_board(value: Any, board_size: int) -> list[list[str | None]]:
             normalized_row.append(normalized)
         result.append(normalized_row)
     return result
+
+
+def _validated_rooms(value: Any) -> list[RoomSummary]:
+    if not isinstance(value, list):
+        raise ValueError("room_list.rooms must be a list")
+    rooms: list[RoomSummary] = []
+    seen_ids: set[str] = set()
+    for item in value:
+        if not isinstance(item, dict):
+            raise ValueError("Each room must be an object")
+        room_id = item.get("room_id")
+        room_name = item.get("room_name", room_id)
+        board_size = item.get("board_size")
+        players = item.get("players")
+        max_players = item.get("max_players")
+        status = item.get("status")
+        if not isinstance(room_id, str) or not room_id or room_id in seen_ids:
+            raise ValueError("Room IDs must be non-empty and unique")
+        if "room_name" in item:
+            room_name = _room_name_from_message(item, room_id)
+        elif not isinstance(room_name, str) or not room_name:
+            raise ValueError("Room names must be non-empty strings")
+        _validate_board_size(board_size)
+        if (
+            isinstance(players, bool)
+            or not isinstance(players, int)
+            or isinstance(max_players, bool)
+            or not isinstance(max_players, int)
+            or max_players < 1
+            or not 0 <= players <= max_players
+        ):
+            raise ValueError("Room player counts are invalid")
+        if not isinstance(status, str) or not status:
+            raise ValueError("Room status must be a non-empty string")
+        seen_ids.add(room_id)
+        rooms.append(
+            RoomSummary(
+                room_id=room_id,
+                room_name=room_name,
+                board_size=board_size,
+                players=players,
+                max_players=max_players,
+                status=status.upper(),
+            )
+        )
+    return rooms
+
+
+def _room_name_from_message(data: dict[str, Any], fallback: str) -> str:
+    if "room_name" not in data:
+        return fallback
+    value = data["room_name"]
+    normalized = normalize_room_name(value)
+    if value != normalized:
+        raise ValueError("room_name must already be normalized")
+    return normalized

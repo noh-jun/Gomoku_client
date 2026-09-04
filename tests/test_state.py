@@ -1,11 +1,12 @@
 import unittest
 
-from omok_client.state import AppState, BLACK, WHITE, new_board
+from omok_client.state import AppState, BLACK, IN_ROOM, LOBBY, WHITE, new_board
 
 
 class AppStateTests(unittest.TestCase):
     def playing_state(self, board_size: int = 15) -> AppState:
         return AppState(
+            view_state=IN_ROOM,
             my_color=BLACK,
             board_size=board_size,
             current_turn=BLACK,
@@ -18,6 +19,133 @@ class AppStateTests(unittest.TestCase):
         large_state = AppState(board_size=19)
         self.assertEqual((len(default_state.board), len(default_state.board[0])), (15, 15))
         self.assertEqual((len(large_state.board), len(large_state.board[0])), (19, 19))
+
+    def test_connected_room_list_join_and_leave_flow(self) -> None:
+        state = AppState()
+        state.apply_server_message({"type": "connected"})
+        self.assertTrue(state.connected)
+        self.assertEqual(state.view_state, LOBBY)
+
+        state.apply_server_message(
+            {
+                "type": "room_list",
+                "rooms": [
+                    {
+                        "room_id": "room_001",
+                        "room_name": "초보 환영",
+                        "board_size": 19,
+                        "players": 1,
+                        "max_players": 2,
+                        "status": "WAITING",
+                    },
+                    {
+                        "room_id": "room_002",
+                        "board_size": 15,
+                        "players": 2,
+                        "max_players": 2,
+                        "status": "PLAYING",
+                    },
+                ],
+            }
+        )
+        self.assertEqual([room.room_id for room in state.rooms], ["room_001", "room_002"])
+        self.assertEqual(state.rooms[0].room_name, "초보 환영")
+        self.assertTrue(state.rooms[0].can_join)
+        self.assertFalse(state.rooms[1].can_join)
+
+        state.apply_server_message(
+            {
+                "type": "joined",
+                "room_id": "room_001",
+                "room_name": "초보 환영",
+                "your_color": WHITE,
+                "board_size": 19,
+                "win_length": 5,
+            }
+        )
+        self.assertEqual(state.view_state, IN_ROOM)
+        self.assertEqual(state.room_id, "room_001")
+        self.assertEqual(state.room_name, "초보 환영")
+
+        state.board[9][9] = WHITE
+        state.apply_server_message({"type": "left_room", "room_id": "room_001"})
+        self.assertEqual(state.view_state, LOBBY)
+        self.assertIsNone(state.room_id)
+        self.assertIsNone(state.my_color)
+        self.assertTrue(all(cell is None for row in state.board for cell in row))
+        self.assertEqual(len(state.rooms), 2)
+
+    def test_room_list_replaces_snapshot_and_rejects_invalid_data_atomically(self) -> None:
+        state = AppState(connected=True, view_state=LOBBY)
+        state.apply_server_message(
+            {
+                "type": "room_list",
+                "rooms": [
+                    {
+                        "room_id": "old",
+                        "board_size": 15,
+                        "players": 1,
+                        "max_players": 2,
+                        "status": "WAITING",
+                    }
+                ],
+            }
+        )
+        with self.assertRaises(ValueError):
+            state.apply_server_message(
+                {
+                    "type": "room_list",
+                    "rooms": [
+                        {
+                            "room_id": "bad",
+                            "board_size": 19,
+                            "players": 3,
+                            "max_players": 2,
+                            "status": "WAITING",
+                        }
+                    ],
+                }
+            )
+        self.assertEqual([room.room_id for room in state.rooms], ["old"])
+
+        state.apply_server_message({"type": "room_list", "rooms": []})
+        self.assertEqual(state.rooms, [])
+
+    def test_disconnect_clears_rooms_and_room_state(self) -> None:
+        state = AppState(connected=True, view_state=LOBBY)
+        state.apply_server_message(
+            {
+                "type": "room_list",
+                "rooms": [
+                    {
+                        "room_id": "room_001",
+                        "board_size": 15,
+                        "players": 0,
+                        "max_players": 2,
+                        "status": "WAITING",
+                    }
+                ],
+            }
+        )
+        state.reset_connection()
+        self.assertFalse(state.connected)
+        self.assertEqual(state.view_state, "DISCONNECTED")
+        self.assertEqual(state.rooms, [])
+
+    def test_player_leaving_room_returns_game_to_waiting(self) -> None:
+        state = self.playing_state()
+        state.apply_server_message({"type": "player_disconnected", "color": WHITE})
+        self.assertEqual(state.view_state, IN_ROOM)
+        self.assertEqual(state.game_status, "WAITING")
+        self.assertIsNone(state.current_turn)
+
+    def test_room_errors_are_user_friendly_without_changing_view(self) -> None:
+        state = AppState(connected=True, view_state=LOBBY)
+        change = state.apply_server_message(
+            {"type": "error", "code": "ROOM_FULL", "message": "Room is full."}
+        )
+        self.assertEqual(change.message, "선택한 방이 가득 찼습니다.")
+        self.assertEqual(state.view_state, LOBBY)
 
     def test_joined_applies_15_settings(self) -> None:
         state = AppState(board_size=19)
@@ -66,7 +194,7 @@ class AppStateTests(unittest.TestCase):
         self.assertTrue(change.redraw_board)
 
     def test_white_can_start_from_server_state(self) -> None:
-        state = AppState(my_color=WHITE)
+        state = AppState(view_state=IN_ROOM, my_color=WHITE)
         state.apply_server_message(
             {
                 "type": "game_start",
@@ -78,6 +206,20 @@ class AppStateTests(unittest.TestCase):
         self.assertEqual(state.current_turn, WHITE)
         self.assertFalse(state.can_move(7, 7))  # Not connected yet.
         state.connected = True
+        self.assertTrue(state.can_move(7, 7))
+
+    def test_game_start_can_apply_server_reassigned_color(self) -> None:
+        state = self.playing_state()
+        state.apply_server_message(
+            {
+                "type": "game_start",
+                "your_color": WHITE,
+                "starting_color": WHITE,
+                "current_turn": WHITE,
+            }
+        )
+        self.assertEqual(state.my_color, WHITE)
+        self.assertEqual(state.starting_color, WHITE)
         self.assertTrue(state.can_move(7, 7))
 
     def test_19_board_move_result_updates_edge(self) -> None:
@@ -238,7 +380,7 @@ class AppStateTests(unittest.TestCase):
         self.assertTrue(state.can_move(18, 18))
 
     def test_finished_game_state_restores_result(self) -> None:
-        state = AppState(my_color=WHITE, connected=True)
+        state = AppState(view_state=IN_ROOM, my_color=WHITE, connected=True)
         board = new_board(19)
         board[9][9] = WHITE
         change = state.apply_server_message(
