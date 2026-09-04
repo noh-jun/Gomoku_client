@@ -1,3 +1,5 @@
+from pathlib import Path
+import tempfile
 from types import SimpleNamespace
 import tkinter as tk
 from tkinter import ttk
@@ -22,13 +24,17 @@ class HoverGuiTests(unittest.TestCase):
         except tk.TclError as exc:
             self.skipTest(f"Tk display unavailable: {exc}")
         self.root.withdraw()
-        self.app = OmokApp(self.root)
+        self.temp_directory = tempfile.TemporaryDirectory()
+        self.settings_path = Path(self.temp_directory.name) / "client_settings.json"
+        self.app = OmokApp(self.root, settings_path=self.settings_path)
         self.app.canvas.configure(width=800, height=700)
         self.root.update_idletasks()
 
     def tearDown(self) -> None:
         if hasattr(self, "app"):
             self.app._on_close()
+        if hasattr(self, "temp_directory"):
+            self.temp_directory.cleanup()
 
     def enter_lobby(self) -> None:
         self.app._handle_network_event(NetworkEvent("connected", message="Connected."))
@@ -37,6 +43,9 @@ class HoverGuiTests(unittest.TestCase):
 
     def test_connection_lobby_and_game_are_separate_pages(self) -> None:
         self.assertEqual(self.app.connection_frame.winfo_manager(), "grid")
+        self.assertFalse(hasattr(self.app, "server_entry"))
+        self.assertEqual(self.app.connect_button.winfo_manager(), "grid")
+        self.assertEqual(self.app.settings_button.winfo_manager(), "grid")
         self.assertEqual(self.app.lobby_frame.winfo_manager(), "")
         self.assertEqual(self.app.game_frame.winfo_manager(), "")
 
@@ -54,6 +63,30 @@ class HoverGuiTests(unittest.TestCase):
         self.assertEqual(self.app.connection_frame.winfo_manager(), "grid")
         self.assertEqual(self.app.lobby_frame.winfo_manager(), "")
         self.assertEqual(str(self.app.connect_button["state"]), "normal")
+
+    def test_connection_settings_canvas_saves_and_cancel_discards(self) -> None:
+        original_url = self.app.server_var.get()
+        self.app._open_settings_modal()
+        self.assertTrue(self.app._settings_modal_open)
+        self.assertEqual(self.app.settings_modal_canvas.winfo_manager(), "place")
+        self.assertEqual(str(self.app.connect_button["state"]), "disabled")
+
+        self.app._settings_server_var.set("ws://10.0.0.2:9000")
+        self.app._close_settings_modal()
+        self.assertEqual(self.app.server_var.get(), original_url)
+        self.assertFalse(self.settings_path.exists())
+
+        self.app._open_settings_modal()
+        self.app._settings_server_var.set("http://invalid.example")
+        self.app._save_settings()
+        self.assertTrue(self.app._settings_modal_open)
+        self.assertIn("ws://", self.app._settings_error_var.get())
+
+        self.app._settings_server_var.set("  ws://10.0.0.2:9000/  ")
+        self.app._save_settings()
+        self.assertFalse(self.app._settings_modal_open)
+        self.assertEqual(self.app.server_var.get(), "ws://10.0.0.2:9000")
+        self.assertIn("10.0.0.2", self.settings_path.read_text(encoding="utf-8"))
 
     def test_you_and_turn_use_stone_images_instead_of_text(self) -> None:
         empty_image = str(self.app._stone_images[None])

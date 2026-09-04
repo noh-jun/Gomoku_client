@@ -12,8 +12,16 @@ venv/
 .coverage
 htmlcov/
 
+# Application build output
+build/
+dist/
+
 # IDE and OS metadata
 .idea/
 .vscode/
 .DS_Store
 Thumbs.db
+
+# Local client connection settings
+client_settings.json
+client_settings.json.tmp

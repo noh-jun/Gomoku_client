@@ -10,6 +10,7 @@ client/
 │   ├── __init__.py
 │   ├── main.py       # 프로그램 진입 및 로깅
 │   ├── board.py      # 동적 BoardGeometry와 양방향 좌표 변환
+│   ├── client_settings.py # 서버 주소 설정 파일 저장 및 로드
 │   ├── protocol.py   # 클라이언트 JSON 인코딩/디코딩
 │   ├── room_name.py  # 방 이름 정규화와 입력 검증
 │   ├── gui.py        # Connection/Lobby/Game 화면과 보드 렌더링
@@ -18,6 +19,7 @@ client/
 │   └── state.py      # 서버 메시지 기반 AppState 변경
 ├── tests/
 │   ├── test_gui.py
+│   ├── test_client_settings.py
 │   ├── test_hover_gui.py
 │   ├── test_network.py
 │   ├── test_protocol.py
@@ -26,6 +28,7 @@ client/
 ├── docs/
 │   └── room-name-server-contract.md # 서버용 Room Name 계약
 ├── client.py
+├── client_settings.json # 최초 Save 후 생성되는 로컬 설정(Git 제외)
 ├── requirements.txt
 └── README.md
 ```
@@ -63,6 +66,8 @@ ws://192.168.1.75:8000/ws
 
 서버는 별도 실행되어 있어야 합니다. TLS 서버는 `wss://` 주소도 사용할 수 있습니다.
 
+최초 Connection 화면에는 Connect 버튼과 우하단 설정 아이콘만 표시됩니다. 설정 아이콘을 누르면 Connection 화면 내부의 Canvas 팝업에서 Server URL을 변경할 수 있습니다. Save 시 개발 환경에서는 `client/client_settings.json`, 배포 실행 파일에서는 실행 파일 옆의 `client_settings.json`에 저장하고 다음 실행부터 자동으로 불러옵니다. 설정 파일이 없거나 JSON 또는 서버 주소가 잘못되면 기본 주소를 사용합니다. 로컬 설정 파일은 Git에서 제외됩니다.
+
 ## 동작 구조
 
 - 메인 스레드는 Tkinter `mainloop()`와 모든 위젯 변경을 담당합니다.
@@ -80,7 +85,7 @@ ws://192.168.1.75:8000/ws
 - 승패 또는 무승부가 확정되면 최종 보드를 유지한 채 결과와 금수 사유를 보드 중앙의 큰 안내 패널로 표시합니다. 패널은 resize에 맞춰 다시 중앙 정렬되며 restart 또는 disconnect 시 제거됩니다.
 - Restart 응답의 새로운 `your_color`를 즉시 적용하므로 라운드 사이 BLACK/WHITE 재배정과 새 색상 Preview를 지원합니다.
 - WebSocket 미연결 상태와 Lobby에서는 바둑판을 표시하지 않으며, `joined`로 Room 입장이 확정된 Game 화면에서만 표시합니다.
-- Connection 페이지는 Server와 Connect를 소유합니다. Lobby 페이지는 연결된 서버·Disconnect·Room 목록·Create·Join을, Game 페이지는 Room·You·Turn·Status·Board 설정·Restart·Leave Room·Disconnect를 소유합니다.
+- Connection 페이지에는 저장된 서버 주소를 사용하는 Connect 버튼과 우하단 설정 아이콘만 표시합니다. 설정은 별도 창이 아닌 Canvas 팝업에서 편집합니다. Lobby 페이지는 연결된 서버·Disconnect·Room 목록·Create·Join을, Game 페이지는 Room·You·Turn·Status·Board 설정·Restart·Leave Room·Disconnect를 소유합니다.
 - Game 영역의 You와 Turn 값은 `BLACK`/`WHITE` 문자열 대신 흑돌·백돌 이미지 아이콘으로 표시하며, 색상이나 턴이 없으면 빈 아이콘으로 표시합니다.
 
 ## 프로토콜

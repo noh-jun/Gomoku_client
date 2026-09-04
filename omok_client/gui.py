@@ -1,11 +1,19 @@
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 from queue import Empty, Queue
 import tkinter as tk
 from tkinter import ttk
 
 from .board import BoardGeometry
+from .client_settings import (
+    ClientSettings,
+    default_settings_path,
+    load_client_settings,
+    normalize_server_url,
+    save_client_settings,
+)
 from .network import NetworkClient, NetworkEvent
 from .room_name import MAX_ROOM_NAME_LENGTH, normalize_room_name
 from .state import AppState, BLACK, DISCONNECTED, IN_ROOM, LOBBY, RoomSummary, WHITE
@@ -17,7 +25,7 @@ RESIZE_DEBOUNCE_MS = 40
 
 
 class OmokApp:
-    def __init__(self, root: tk.Tk) -> None:
+    def __init__(self, root: tk.Tk, settings_path: Path | None = None) -> None:
         self.root = root
         self.root.title("Online Omok")
         self.root.geometry("900x950")
@@ -37,8 +45,11 @@ class OmokApp:
         self.room_cards: dict[str, tk.Button] = {}
         self._room_grid_column_count = 0
         self._create_room_modal_open = False
+        self._settings_modal_open = False
+        self._settings_path = settings_path or default_settings_path()
+        client_settings = load_client_settings(self._settings_path)
 
-        self.server_var = tk.StringVar(value="ws://192.168.1.75:8000")
+        self.server_var = tk.StringVar(value=client_settings.server_url)
         self.room_var = tk.StringVar(value="-")
         self.you_var = tk.StringVar(value="-")
         self.turn_var = tk.StringVar(value="-")
@@ -47,6 +58,8 @@ class OmokApp:
         self.message_var = tk.StringVar(value="Connect to the server.")
         self._create_room_name_var = tk.StringVar()
         self._create_room_error_var = tk.StringVar()
+        self._settings_server_var = tk.StringVar(value=client_settings.server_url)
+        self._settings_error_var = tk.StringVar()
         self._stone_images = {
             None: create_stone_photo(self.root, None),
             BLACK: create_stone_photo(self.root, BLACK),
@@ -82,26 +95,75 @@ class OmokApp:
         footer.columnconfigure(0, weight=1)
 
     def _build_connection_frame(self) -> None:
-        self.connection_frame = ttk.LabelFrame(
-            self.content_frame, text="Connection", padding=30
-        )
+        self.connection_frame = ttk.Frame(self.content_frame, padding=30)
         self.connection_frame.rowconfigure(0, weight=1)
-        self.connection_frame.rowconfigure(3, weight=1)
+        self.connection_frame.rowconfigure(2, weight=1)
         self.connection_frame.columnconfigure(0, weight=1)
 
-        ttk.Label(
+        self.connect_button = ttk.Button(
             self.connection_frame,
-            text="Connect to Gomoku Server",
-            font=("TkDefaultFont", 20, "bold"),
-        ).grid(row=1, column=0, pady=(0, 20))
-        form = ttk.Frame(self.connection_frame)
-        form.grid(row=2, column=0, sticky="n")
-        form.columnconfigure(1, weight=1)
-        ttk.Label(form, text="Server:").grid(row=0, column=0, sticky="w")
-        self.server_entry = ttk.Entry(form, textvariable=self.server_var, width=42)
-        self.server_entry.grid(row=0, column=1, padx=8)
-        self.connect_button = ttk.Button(form, text="Connect", command=self._connect)
-        self.connect_button.grid(row=0, column=2)
+            text="Connect",
+            command=self._connect,
+            padding=(42, 16),
+        )
+        self.connect_button.grid(row=1, column=0)
+        self.settings_button = tk.Button(
+            self.connection_frame,
+            text="⚙",
+            command=self._open_settings_modal,
+            font=("Segoe UI Symbol", 22),
+            foreground="#4B4033",
+            background="#F4E8D0",
+            activebackground="#E8D3AE",
+            relief="flat",
+            borderwidth=0,
+            padx=10,
+            pady=6,
+            cursor="hand2",
+            takefocus=True,
+        )
+        self.settings_button.grid(row=3, column=0, sticky="se")
+
+        self.settings_modal_canvas = tk.Canvas(
+            self.connection_frame,
+            background="#6B6258",
+            highlightthickness=0,
+            takefocus=True,
+        )
+        self.settings_modal_canvas.bind(
+            "<Configure>", lambda _event: self._draw_settings_modal()
+        )
+        self.settings_server_entry = ttk.Entry(
+            self.settings_modal_canvas,
+            textvariable=self._settings_server_var,
+            width=42,
+        )
+        self.settings_modal_error_label = tk.Label(
+            self.settings_modal_canvas,
+            textvariable=self._settings_error_var,
+            foreground="#B42318",
+            background="#FFF8EA",
+            anchor="w",
+        )
+        self.settings_modal_cancel_button = ttk.Button(
+            self.settings_modal_canvas,
+            text="Cancel",
+            command=self._close_settings_modal,
+        )
+        self.settings_modal_save_button = ttk.Button(
+            self.settings_modal_canvas,
+            text="Save",
+            command=self._save_settings,
+        )
+        for widget in (
+            self.settings_server_entry,
+            self.settings_modal_cancel_button,
+            self.settings_modal_save_button,
+        ):
+            widget.bind("<Escape>", lambda _event: self._close_settings_modal())
+        self.settings_server_entry.bind(
+            "<Return>", lambda _event: self._save_settings()
+        )
 
     def _build_lobby_frame(self) -> None:
         self.lobby_frame = ttk.LabelFrame(self.content_frame, text="Lobby", padding=10)
@@ -256,6 +318,108 @@ class OmokApp:
         self.canvas.bind("<Leave>", self._on_mouse_leave)
         self.canvas.bind("<Configure>", self._on_canvas_configure)
 
+    def _open_settings_modal(self) -> None:
+        if self.state.connected or self._connecting or self._settings_modal_open:
+            return
+        self._settings_modal_open = True
+        self._settings_server_var.set(self.server_var.get())
+        self._settings_error_var.set("")
+        self.settings_modal_canvas.place(x=0, y=0, relwidth=1, relheight=1)
+        self.settings_modal_canvas.tk.call("raise", self.settings_modal_canvas._w)
+        self.root.update_idletasks()
+        self._draw_settings_modal()
+        self.settings_server_entry.focus_set()
+        self._render_controls()
+
+    def _draw_settings_modal(self) -> None:
+        if not self._settings_modal_open:
+            return
+        canvas = self.settings_modal_canvas
+        canvas.delete("all")
+        width = max(canvas.winfo_width(), 560)
+        height = max(canvas.winfo_height(), 360)
+        center_x = width / 2
+        center_y = height / 2
+        panel_width = min(540, width - 50)
+        panel_height = 270
+        left = center_x - panel_width / 2
+        right = center_x + panel_width / 2
+        top = center_y - panel_height / 2
+        bottom = center_y + panel_height / 2
+
+        canvas.create_rectangle(0, 0, width, height, fill="#6B6258", outline="")
+        canvas.create_rectangle(
+            left,
+            top,
+            right,
+            bottom,
+            fill="#FFF8EA",
+            outline="#7B542B",
+            width=3,
+        )
+        canvas.create_text(
+            center_x,
+            top + 44,
+            text="Connection Settings",
+            fill="#3E2B18",
+            font=("TkDefaultFont", 18, "bold"),
+        )
+        canvas.create_text(
+            left + 32,
+            top + 91,
+            text="Server URL",
+            anchor="w",
+            fill="#3E2B18",
+            font=("TkDefaultFont", 10, "bold"),
+        )
+        canvas.create_window(
+            center_x,
+            top + 124,
+            window=self.settings_server_entry,
+            width=panel_width - 64,
+        )
+        canvas.create_window(
+            center_x,
+            top + 160,
+            window=self.settings_modal_error_label,
+            width=panel_width - 64,
+        )
+        canvas.create_window(
+            center_x - 48,
+            bottom - 42,
+            window=self.settings_modal_cancel_button,
+        )
+        canvas.create_window(
+            center_x + 48,
+            bottom - 42,
+            window=self.settings_modal_save_button,
+        )
+
+    def _save_settings(self) -> None:
+        if not self._settings_modal_open:
+            return
+        try:
+            server_url = normalize_server_url(self._settings_server_var.get())
+            save_client_settings(
+                ClientSettings(server_url=server_url), self._settings_path
+            )
+        except (OSError, ValueError) as exc:
+            self._settings_error_var.set(str(exc))
+            return
+        self.server_var.set(server_url)
+        self._close_settings_modal()
+        self.message_var.set("Connection settings saved.")
+
+    def _close_settings_modal(self) -> None:
+        if not self._settings_modal_open:
+            return
+        self._settings_modal_open = False
+        self.settings_modal_canvas.place_forget()
+        self.settings_modal_canvas.delete("all")
+        self._settings_server_var.set(self.server_var.get())
+        self._settings_error_var.set("")
+        self._render_controls()
+
     def _disconnect(self) -> None:
         if not self.state.connected:
             return
@@ -265,6 +429,8 @@ class OmokApp:
         self.message_var.set("Disconnecting...")
 
     def _connect(self) -> None:
+        if self._settings_modal_open:
+            return
         try:
             started = self.network.connect(self.server_var.get())
         except ValueError as exc:
@@ -606,6 +772,8 @@ class OmokApp:
             self.connection_frame.grid(row=0, column=0, sticky="nsew")
         if self.state.view_state != LOBBY:
             self._close_create_room_modal()
+        if self.state.view_state != DISCONNECTED:
+            self._close_settings_modal()
         self._render_controls()
 
     def _render_room_list(self) -> None:
@@ -692,12 +860,17 @@ class OmokApp:
         self._render_controls()
 
     def _render_controls(self) -> None:
+        connection_available = (
+            not self.state.connected
+            and not self._connecting
+            and not self._settings_modal_open
+        )
         self.connect_button.configure(
             text="Connect",
-            state="disabled" if self.state.connected or self._connecting else "normal",
+            state="normal" if connection_available else "disabled",
         )
-        self.server_entry.configure(
-            state="disabled" if self.state.connected or self._connecting else "normal"
+        self.settings_button.configure(
+            state="normal" if connection_available else "disabled"
         )
         in_lobby = self.state.connected and self.state.view_state == LOBBY
         lobby_available = in_lobby and not self._create_room_modal_open
@@ -871,6 +1044,7 @@ class OmokApp:
         if self._closing:
             return
         self._closing = True
+        self._close_settings_modal()
         self._close_create_room_modal()
         self._clear_hover()
         if self._resize_after_id is not None:
