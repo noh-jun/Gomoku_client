@@ -70,7 +70,7 @@ ws://192.168.1.75:8000/ws
 - 네트워크 스레드는 `queue.Queue`에 이벤트를 넣고, GUI는 `root.after()`로 큐를 주기적으로 처리합니다.
 - GUI의 전송 요청은 `asyncio.run_coroutine_threadsafe()`로 네트워크 루프에 전달됩니다.
 - 화면 상태는 `DISCONNECTED`, `LOBBY`, `IN_ROOM`으로 분리합니다. 최초에는 Connection 페이지만 표시하고 서버의 `connected` 확인을 받은 뒤 Room List가 있는 Lobby 페이지로 전환합니다. Room 입장 후에는 Game 페이지를 표시하며 연결 해제 시 Connection 페이지로 돌아갑니다.
-- Lobby는 서버 `room_list` 스냅샷을 여러 열의 Room 카드로 실시간 반영합니다. 각 카드는 돌 아이콘과 Room 이름·ID·보드 크기·인원·상태를 표시하며, 클릭하면 선택되고 더블클릭하면 입장을 요청합니다. Create Room은 별도 창이 아닌 Lobby 중앙의 Canvas 모달을 열며, 모달이 열린 동안 뒤쪽 Lobby 입력을 차단합니다. Create/Join은 `joined`, Leave는 `left_room`을 받아야 화면 상태를 확정합니다.
+- Lobby는 서버 `room_list` 스냅샷을 여러 열의 Room 카드로 실시간 반영합니다. 각 카드는 서버가 정규화한 Room 이름·보드 크기·인원·상태를 표시하고, `room_id`는 화면에 노출하지 않은 채 선택과 입장 요청의 내부 키로만 사용합니다. 클릭하면 선택되고 더블클릭하면 입장을 요청합니다. Create Room은 별도 창이 아닌 Lobby 중앙의 Canvas 모달을 열며, 모달이 열린 동안 뒤쪽 Lobby 입력을 차단합니다. Create/Join은 `joined`, Leave는 `left_room`을 받아야 화면 상태를 확정합니다.
 - 클릭 시 로컬 보드를 먼저 변경하지 않습니다. 서버의 `move_result`가 도착해야 돌이 표시됩니다.
 - Restart 버튼도 요청만 보내며, 서버의 `restart`가 도착해야 보드를 초기화합니다.
 - Canvas 크기와 논리 보드 크기를 분리하며, 창 크기가 바뀌면 동일한 `BoardGeometry`로 격자·돌·마지막 착수·클릭 좌표를 다시 계산합니다.

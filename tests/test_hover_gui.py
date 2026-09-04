@@ -107,6 +107,7 @@ class HoverGuiTests(unittest.TestCase):
         )
         self.assertEqual(tuple(self.app.room_cards), ("room_001", "room_002"))
         self.assertIn("초보 환영", str(self.app.room_cards["room_001"]["text"]))
+        self.assertNotIn("room_001", str(self.app.room_cards["room_001"]["text"]))
         self.app._layout_room_cards(440)
         self.assertEqual(int(self.app.room_cards["room_002"].grid_info()["column"]), 1)
         self.app._layout_room_cards(219)
@@ -170,6 +171,7 @@ class HoverGuiTests(unittest.TestCase):
         self.app._select_room("room_001")
         self.app._join_selected_room()
         self.assertEqual(joined_requests, ["room_001"])
+        self.assertEqual(self.app.message_var.get(), "Joining '친선 대국'...")
         self.assertEqual(self.app.state.view_state, "LOBBY")
         self.assertTrue(self.app._room_request_pending)
 

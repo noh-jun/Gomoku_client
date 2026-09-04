@@ -212,31 +212,35 @@ class OmokApp:
         info = ttk.LabelFrame(self.game_frame, text="Game", padding=7)
         info.grid(row=0, column=0, sticky="ew")
         ttk.Label(info, text="Room:").grid(row=0, column=0)
-        ttk.Label(info, textvariable=self.room_var, width=16).grid(
-            row=0, column=1, padx=(4, 12), sticky="w"
+        ttk.Label(
+            info,
+            textvariable=self.room_var,
+            font=("TkDefaultFont", 11, "bold"),
+        ).grid(
+            row=0, column=1, columnspan=9, padx=(4, 0), pady=(0, 6), sticky="w"
         )
-        ttk.Label(info, text="You:").grid(row=0, column=2)
+        ttk.Label(info, text="You:").grid(row=1, column=0)
         self.you_stone_label = ttk.Label(info, image=self._stone_images[None])
-        self.you_stone_label.grid(row=0, column=3, padx=(4, 12), sticky="w")
-        ttk.Label(info, text="Turn:").grid(row=0, column=4)
+        self.you_stone_label.grid(row=1, column=1, padx=(4, 12), sticky="w")
+        ttk.Label(info, text="Turn:").grid(row=1, column=2)
         self.turn_stone_label = ttk.Label(info, image=self._stone_images[None])
-        self.turn_stone_label.grid(row=0, column=5, padx=(4, 12), sticky="w")
-        ttk.Label(info, text="Status:").grid(row=0, column=6)
+        self.turn_stone_label.grid(row=1, column=3, padx=(4, 12), sticky="w")
+        ttk.Label(info, text="Status:").grid(row=1, column=4)
         ttk.Label(info, textvariable=self.status_var, width=11).grid(
-            row=0, column=7, sticky="w"
+            row=1, column=5, sticky="w"
         )
         ttk.Label(info, textvariable=self.settings_var).grid(
-            row=0, column=8, padx=(10, 0), sticky="e"
+            row=1, column=6, padx=(10, 0), sticky="e"
         )
-        info.columnconfigure(8, weight=1)
+        info.columnconfigure(6, weight=1)
         self.restart_button = ttk.Button(info, text="Restart", command=self._request_restart)
-        self.restart_button.grid(row=0, column=9, padx=(10, 0))
+        self.restart_button.grid(row=1, column=7, padx=(10, 0))
         self.leave_room_button = ttk.Button(info, text="Leave Room", command=self._leave_room)
-        self.leave_room_button.grid(row=0, column=10, padx=(7, 0))
+        self.leave_room_button.grid(row=1, column=8, padx=(7, 0))
         self.game_disconnect_button = ttk.Button(
             info, text="Disconnect", command=self._disconnect
         )
-        self.game_disconnect_button.grid(row=0, column=11, padx=(7, 0))
+        self.game_disconnect_button.grid(row=1, column=9, padx=(7, 0))
 
         self.canvas = tk.Canvas(
             self.game_frame,
@@ -410,7 +414,7 @@ class OmokApp:
             return
         self._room_request_pending = True
         self.network.join_room(room.room_id)
-        self.message_var.set(f"Joining {room.room_id}...")
+        self.message_var.set(f"Joining '{room.room_name}'...")
         self._render_controls()
 
     def _leave_room(self) -> None:
@@ -615,7 +619,6 @@ class OmokApp:
                 self.room_grid,
                 text=(
                     f"{room.room_name}\n"
-                    f"ID  {room.room_id}\n"
                     f"{room.board_size} × {room.board_size}\n"
                     f"Players  {room.players} / {room.max_players}\n"
                     f"{room.status}"
