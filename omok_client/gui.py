@@ -8,6 +8,13 @@ from tkinter import ttk
 
 from .board import BoardGeometry
 from .board_renderer import OthelloBoardGeometry
+from .canvas_overlay import (
+    ActionModalOverlay,
+    CanvasOverlay,
+    OverlayAction,
+    OverlayOptions,
+    SystemBlockingOverlay,
+)
 from .client_settings import (
     ClientSettings,
     default_settings_path,
@@ -18,8 +25,20 @@ from .client_settings import (
 from .game_type import GameType
 from .network import NetworkClient, NetworkEvent
 from .room_name import MAX_ROOM_NAME_LENGTH, normalize_room_name
-from .state import AppState, BLACK, DISCONNECTED, IN_ROOM, LOBBY, RoomSummary, WHITE
+from .state import (
+    AppState,
+    BLACK,
+    DISCONNECTED,
+    IN_ROOM,
+    LOBBY,
+    OBSERVER,
+    PLAYER,
+    RoomSummary,
+    WHITE,
+)
 from .stone_image import create_stone_photo
+from .turn_timer import TurnTimer
+from .turn_timer_widget import TurnTimerWidget
 
 LOGGER = logging.getLogger(__name__)
 INITIAL_CANVAS_SIZE = 780
@@ -27,6 +46,8 @@ RESIZE_DEBOUNCE_MS = 40
 FORBIDDEN_COLOR = "#C62828"
 FORBIDDEN_REJECTED_COLOR = "#FF5252"
 FORBIDDEN_FLASH_MS = 900
+INFINITE_TURN_TIME = "INFINITE"
+TURN_TIME_OPTIONS = ("5", "10", "15", "30", "60", INFINITE_TURN_TIME)
 
 
 class OmokApp:
@@ -41,8 +62,13 @@ class OmokApp:
         self._connecting = False
         self._room_request_pending = False
         self._leave_pending = False
-        self._restart_pending = False
+        self._ready_request_pending = False
+        self._role_change_pending = False
         self._move_pending = False
+        self._turn_timer_display_expired = False
+        self._undo_pending = False
+        self._undo_waiting_for_game_state = False
+        self._result_popup_dismissed = False
         self._closing = False
         self._resize_after_id: str | None = None
         self._forbidden_flash_after_id: str | None = None
@@ -64,10 +90,12 @@ class OmokApp:
         self.settings_var = tk.StringVar(value="Board: 15 x 15 / Win: 5")
         self.game_type_var = tk.StringVar(value="-")
         self.score_var = tk.StringVar(value="")
+        self.role_var = tk.StringVar(value="Role: -")
         self.message_var = tk.StringVar(value="Connect to the server.")
         self._create_room_name_var = tk.StringVar()
         self._create_room_error_var = tk.StringVar()
         self._create_room_game_type_var = tk.StringVar(value=GameType.GOMOKU.value)
+        self._create_room_turn_time_var = tk.StringVar(value=INFINITE_TURN_TIME)
         self._settings_server_var = tk.StringVar(value=client_settings.server_url)
         self._settings_error_var = tk.StringVar()
         self._stone_images = {
@@ -261,13 +289,25 @@ class OmokApp:
             text="Gomoku",
             variable=self._create_room_game_type_var,
             value=GameType.GOMOKU.value,
+            command=self._on_create_room_game_type_changed,
         )
         self.create_othello_radio = ttk.Radiobutton(
             self.create_room_modal_canvas,
             text="Othello",
             variable=self._create_room_game_type_var,
             value=GameType.OTHELLO.value,
+            command=self._on_create_room_game_type_changed,
         )
+        self.create_turn_time_radios: list[ttk.Radiobutton] = []
+        for value in TURN_TIME_OPTIONS:
+            label = "Infinite" if value == INFINITE_TURN_TIME else f"{value} sec"
+            radio = ttk.Radiobutton(
+                self.create_room_modal_canvas,
+                text=label,
+                variable=self._create_room_turn_time_var,
+                value=value,
+            )
+            self.create_turn_time_radios.append(radio)
         self.create_room_modal_cancel_button = ttk.Button(
             self.create_room_modal_canvas,
             text="Cancel",
@@ -282,6 +322,7 @@ class OmokApp:
             self.create_room_name_entry,
             self.create_gomoku_radio,
             self.create_othello_radio,
+            *self.create_turn_time_radios,
             self.create_room_modal_cancel_button,
             self.create_room_modal_submit_button,
         ):
@@ -297,43 +338,64 @@ class OmokApp:
 
         info = ttk.LabelFrame(self.game_frame, text="Game", padding=7)
         info.grid(row=0, column=0, sticky="ew")
-        ttk.Label(info, text="Room:").grid(row=0, column=0)
+        self.turn_timer_widget = TurnTimerWidget(info)
+        self.turn_timer_widget.grid(
+            row=0,
+            column=0,
+            rowspan=3,
+            padx=(0, 14),
+            sticky="nw",
+        )
+        ttk.Label(info, text="Room:").grid(row=0, column=2)
         ttk.Label(
             info,
             textvariable=self.room_var,
             font=("TkDefaultFont", 11, "bold"),
         ).grid(
-            row=0, column=1, columnspan=5, padx=(4, 0), pady=(0, 6), sticky="w"
+            row=0, column=3, columnspan=3, padx=(4, 0), pady=(0, 6), sticky="w"
         )
-        ttk.Label(info, text="Game:").grid(row=0, column=7, sticky="e")
+        ttk.Label(info, text="Game:").grid(row=0, column=9, sticky="e")
         ttk.Label(info, textvariable=self.game_type_var, width=9).grid(
-            row=0, column=8, columnspan=2, padx=(4, 0), sticky="w"
+            row=0, column=10, columnspan=2, padx=(4, 0), sticky="w"
         )
-        ttk.Label(info, text="You:").grid(row=1, column=0)
+        ttk.Label(info, text="You:").grid(row=1, column=2)
         self.you_stone_label = ttk.Label(info, image=self._stone_images[None])
-        self.you_stone_label.grid(row=1, column=1, padx=(4, 12), sticky="w")
-        ttk.Label(info, text="Turn:").grid(row=1, column=2)
+        self.you_stone_label.grid(row=1, column=3, padx=(4, 12), sticky="w")
+        ttk.Label(info, text="Turn:").grid(row=1, column=4)
         self.turn_stone_label = ttk.Label(info, image=self._stone_images[None])
-        self.turn_stone_label.grid(row=1, column=3, padx=(4, 12), sticky="w")
-        ttk.Label(info, text="Status:").grid(row=1, column=4)
+        self.turn_stone_label.grid(row=1, column=5, padx=(4, 12), sticky="w")
+        ttk.Label(info, text="Status:").grid(row=1, column=6)
         ttk.Label(info, textvariable=self.status_var, width=11).grid(
-            row=1, column=5, sticky="w"
+            row=1, column=7, sticky="w"
         )
         ttk.Label(info, textvariable=self.settings_var).grid(
-            row=1, column=6, padx=(10, 0), sticky="e"
+            row=1, column=8, padx=(10, 0), sticky="e"
         )
-        info.columnconfigure(6, weight=1)
+        info.columnconfigure(8, weight=1)
+        ttk.Label(info, textvariable=self.role_var).grid(
+            row=2, column=2, columnspan=3, pady=(5, 0), sticky="w"
+        )
         ttk.Label(info, textvariable=self.score_var).grid(
-            row=2, column=0, columnspan=7, pady=(5, 0), sticky="w"
+            row=2, column=5, columnspan=4, pady=(5, 0), sticky="w"
         )
-        self.restart_button = ttk.Button(info, text="Restart", command=self._request_restart)
-        self.restart_button.grid(row=1, column=7, padx=(10, 0))
+        self.undo_button = ttk.Button(info, text="Undo", command=self._request_undo)
+        self.undo_button.grid(row=1, column=9, padx=(10, 0))
+        self.ready_button = ttk.Button(info, text="Ready", command=self._send_ready)
+        self.ready_button.grid(row=1, column=10, padx=(7, 0))
+        self.become_player_button = ttk.Button(
+            info, text="Become Player", command=self._become_player
+        )
+        self.become_player_button.grid(row=2, column=9, columnspan=2, padx=(10, 0))
+        self.become_observer_button = ttk.Button(
+            info, text="Observe", command=self._become_observer
+        )
+        self.become_observer_button.grid(row=2, column=11, columnspan=2, padx=(7, 0))
         self.leave_room_button = ttk.Button(info, text="Leave Room", command=self._leave_room)
-        self.leave_room_button.grid(row=1, column=8, padx=(7, 0))
+        self.leave_room_button.grid(row=1, column=11, padx=(7, 0))
         self.game_disconnect_button = ttk.Button(
             info, text="Disconnect", command=self._disconnect
         )
-        self.game_disconnect_button.grid(row=1, column=9, padx=(7, 0))
+        self.game_disconnect_button.grid(row=1, column=12, padx=(7, 0))
 
         self.canvas = tk.Canvas(
             self.game_frame,
@@ -348,6 +410,28 @@ class OmokApp:
         self.canvas.bind("<Motion>", self._on_mouse_move)
         self.canvas.bind("<Leave>", self._on_mouse_leave)
         self.canvas.bind("<Configure>", self._on_canvas_configure)
+        self.board_overlay = CanvasOverlay(self.canvas)
+        self.undo_action_overlay = ActionModalOverlay(self.canvas)
+        self.undo_blocking_overlay = SystemBlockingOverlay(self.canvas)
+        self.ready_blocking_overlay = SystemBlockingOverlay(self.canvas)
+        self.turn_timer = TurnTimer(self.root, self._set_turn_time_display)
+
+    def _set_turn_time_display(self, text: str, warning: bool) -> None:
+        """Apply presentation output from the display-only turn timer."""
+        self.turn_timer_widget.set_display(text, warning)
+        self._turn_timer_display_expired = text == "00:00"
+        if self._turn_timer_display_expired:
+            self._clear_hover()
+
+    def _sync_turn_timer_from_state(self) -> None:
+        if self.state.game_status != "PLAYING":
+            self.turn_timer.deactivate()
+            return
+        self.turn_timer.synchronize(
+            self.state.turn_time_limit_sec,
+            self.state.turn_deadline_unix_ms,
+            self.state.turn_revision,
+        )
 
     def _open_settings_modal(self) -> None:
         if self.state.connected or self._connecting or self._settings_modal_open:
@@ -493,10 +577,12 @@ class OmokApp:
         self._create_room_name_var.set("")
         self._create_room_error_var.set("")
         self._create_room_game_type_var.set(GameType.GOMOKU.value)
+        self._create_room_turn_time_var.set(INFINITE_TURN_TIME)
         othello_supported = GameType.OTHELLO in self.state.supported_game_types
         self.create_othello_radio.configure(
             state="normal" if othello_supported else "disabled"
         )
+        self._on_create_room_game_type_changed()
         self.create_room_modal_canvas.place(
             x=0, y=0, relwidth=1, relheight=1
         )
@@ -518,7 +604,7 @@ class OmokApp:
         center_x = width / 2
         center_y = height / 2
         panel_width = min(460, width - 50)
-        panel_height = 340
+        panel_height = 430
         left = center_x - panel_width / 2
         right = center_x + panel_width / 2
         top = center_y - panel_height / 2
@@ -591,6 +677,24 @@ class OmokApp:
             anchor="w",
             tags=("modal",),
         )
+        canvas.create_text(
+            left + 30,
+            top + 260,
+            text="Turn Time",
+            anchor="w",
+            fill="#3E2B18",
+            font=("TkDefaultFont", 10, "bold"),
+            tags=("modal",),
+        )
+        for index, radio in enumerate(self.create_turn_time_radios):
+            row, column = divmod(index, 3)
+            canvas.create_window(
+                left + 55 + column * 125,
+                top + 292 + row * 34,
+                window=radio,
+                anchor="w",
+                tags=("modal",),
+            )
         canvas.create_window(
             center_x - 48,
             bottom - 42,
@@ -612,11 +716,19 @@ class OmokApp:
             game_type = GameType.from_wire(self._create_room_game_type_var.get())
             if game_type not in self.state.supported_game_types:
                 raise ValueError("서버가 지원하지 않는 게임 종류입니다.")
+            raw_turn_time = self._create_room_turn_time_var.get()
+            turn_time_limit_sec = (
+                None
+                if raw_turn_time == INFINITE_TURN_TIME
+                else int(raw_turn_time)
+            )
+            if game_type is GameType.OTHELLO and turn_time_limit_sec is not None:
+                raise ValueError("오셀로는 착수 제한 시간을 지원하지 않습니다.")
         except ValueError as exc:
             self._create_room_error_var.set(str(exc))
             return
         self._room_request_pending = True
-        self.network.create_room(room_name, game_type)
+        self.network.create_room(room_name, game_type, turn_time_limit_sec)
         self._close_create_room_modal()
         self.message_var.set(f"Creating {game_type.label} room '{room_name}'...")
         self._render_controls()
@@ -630,7 +742,16 @@ class OmokApp:
         self._create_room_name_var.set("")
         self._create_room_error_var.set("")
         self._create_room_game_type_var.set(GameType.GOMOKU.value)
+        self._create_room_turn_time_var.set(INFINITE_TURN_TIME)
         self._render_controls()
+
+    def _on_create_room_game_type_changed(self) -> None:
+        is_gomoku = self._create_room_game_type_var.get() == GameType.GOMOKU.value
+        if not is_gomoku:
+            self._create_room_turn_time_var.set(INFINITE_TURN_TIME)
+        state = "normal" if is_gomoku else "disabled"
+        for radio in self.create_turn_time_radios:
+            radio.configure(state=state)
 
     def _join_selected_room(self) -> None:
         room = self._selected_room()
@@ -647,25 +768,91 @@ class OmokApp:
         self._render_controls()
 
     def _leave_room(self) -> None:
-        if self.state.view_state != IN_ROOM or self._leave_pending:
+        if (
+            self.state.view_state != IN_ROOM
+            or self._leave_pending
+            or (
+                self.state.my_role == PLAYER
+                and self.state.game_status == "PLAYING"
+            )
+        ):
             return
         self._leave_pending = True
         self.network.leave_room()
         self.message_var.set("Leaving room... Waiting for server confirmation.")
         self._render_controls()
 
-    def _request_restart(self) -> None:
+    def _send_ready(self) -> None:
         if (
             self.state.view_state != IN_ROOM
             or not self.state.connected
-            or not self.state.is_finished
-            or self._restart_pending
+            or self.state.game_status not in {"WAITING", "FINISHED"}
+            or self.state.my_role != PLAYER
+            or self.state.player_count != 2
+            or self.state.my_ready
+            or self._ready_request_pending
+            or self._undo_pending
         ):
             return
-        self.network.request_restart()
-        self._restart_pending = True
-        self.message_var.set("Restart requested. Waiting for opponent...")
+        self._ready_request_pending = True
+        self.network.send_ready()
+        self.message_var.set("Ready sent. Waiting for server confirmation...")
         self._render_controls()
+
+    def _become_player(self) -> None:
+        if (
+            self.state.view_state != IN_ROOM
+            or self.state.my_role != OBSERVER
+            or self.state.game_status == "PLAYING"
+            or self.state.player_count >= 2
+            or self._role_change_pending
+        ):
+            return
+        self._role_change_pending = True
+        self.network.become_player()
+        self.message_var.set("Requesting Player role...")
+        self._render_controls()
+
+    def _become_observer(self) -> None:
+        if (
+            self.state.view_state != IN_ROOM
+            or self.state.my_role != PLAYER
+            or self.state.game_status == "PLAYING"
+            or self._role_change_pending
+        ):
+            return
+        self._role_change_pending = True
+        self.network.become_observer()
+        self.message_var.set("Requesting Observer role...")
+        self._render_controls()
+
+    def _request_undo(self) -> None:
+        if (
+            self.state.view_state != IN_ROOM
+            or not self.state.connected
+            or self.state.game_type is not GameType.GOMOKU
+            or self.state.game_status != "PLAYING"
+            or not self.state.has_accepted_move
+            or self._undo_pending
+        ):
+            return
+        self._undo_pending = True
+        self._undo_waiting_for_game_state = False
+        self._clear_hover()
+        self.undo_blocking_overlay.show_blocking(
+            "착수 되돌리기",
+            "상대방의 응답을 기다리는 중입니다.",
+        )
+        self.network.request_undo()
+        self.message_var.set("Undo requested. Waiting for opponent...")
+        self._render_controls()
+
+    def _respond_undo(self, accepted: bool) -> None:
+        if not self._undo_pending or not self.undo_action_overlay.visible:
+            return
+        self.undo_action_overlay.set_actions_enabled(False)
+        self.network.respond_undo(accepted)
+        self.message_var.set("Undo response sent. Waiting for server...")
 
     def _selected_room(self) -> RoomSummary | None:
         return next(
@@ -689,7 +876,15 @@ class OmokApp:
         self._layout_room_cards(event.width)
 
     def _on_board_click(self, event: tk.Event[tk.Misc]) -> None:
-        if self._move_pending:
+        if self.undo_action_overlay.consume_click():
+            return
+        if self.ready_blocking_overlay.consume_click():
+            return
+        if self.undo_blocking_overlay.consume_click():
+            return
+        if self.board_overlay.consume_click():
+            return
+        if self._move_pending or self._turn_timer_display_expired:
             return
         coordinate = self._pointer_to_board(event.x, event.y)
         if coordinate is None:
@@ -704,7 +899,9 @@ class OmokApp:
                 self.message_var.set("It is not your turn.")
             elif self.state.is_forbidden_for_me(x, y):
                 label = self.state.forbidden_label_at(x, y) or "금수"
-                self.message_var.set(f"{label} 자리입니다. 다른 곳에 두세요.")
+                self._show_forbidden_popup(
+                    f"{label} 자리입니다.\n다른 곳에 두세요."
+                )
             elif self.state.board[y][x] is not None:
                 self.message_var.set("That position is already occupied.")
             return
@@ -714,6 +911,15 @@ class OmokApp:
         self.message_var.set(f"Move ({x}, {y}) sent. Waiting for server...")
 
     def _on_mouse_move(self, event: tk.Event[tk.Misc]) -> None:
+        if (
+            self.undo_action_overlay.visible
+            or self.ready_blocking_overlay.visible
+            or self.undo_blocking_overlay.visible
+            or self.board_overlay.visible
+            or self._turn_timer_display_expired
+        ):
+            self._clear_hover()
+            return
         coordinate = self._pointer_to_board(event.x, event.y)
         if coordinate is not None and (
             self._move_pending or not self.state.can_move(*coordinate)
@@ -742,9 +948,81 @@ class OmokApp:
     def _clear_pending_requests(self) -> None:
         self._room_request_pending = False
         self._leave_pending = False
-        self._restart_pending = False
+        self._role_change_pending = False
         self._move_pending = False
+        self._clear_ready_state()
+        self._clear_undo_state()
         self._cancel_forbidden_flash()
+
+    def _clear_ready_state(self) -> None:
+        self._ready_request_pending = False
+        self.ready_blocking_overlay.clear_from_system()
+
+    def _clear_undo_state(self) -> None:
+        self._undo_pending = False
+        self._undo_waiting_for_game_state = False
+        self.undo_action_overlay.clear()
+        self.undo_blocking_overlay.clear_from_system()
+
+    def _show_forbidden_popup(self, message: str) -> None:
+        self._clear_hover()
+        self.board_overlay.show(
+            OverlayOptions(
+                title="착수 불가",
+                message=message,
+                kind="warning",
+            ),
+            on_dismiss=self._dismiss_forbidden_popup,
+        )
+
+    def _show_undo_result_popup(
+        self, accepted: bool, requested_by_me: bool = False
+    ) -> None:
+        self._clear_hover()
+        if accepted:
+            message = "착수가 되돌려졌습니다."
+        elif requested_by_me:
+            message = "상대방이 되돌리기 요청을 거절했습니다."
+        else:
+            message = "되돌리기 요청을 거절했습니다."
+        self.board_overlay.show(
+            OverlayOptions(
+                title="되돌리기 완료" if accepted else "되돌리기 거절",
+                message=message,
+                kind="info" if accepted else "warning",
+                dismiss_on_click=True,
+                dismiss_hint="클릭하면 닫힙니다",
+                content_tag="undo_result_overlay",
+            )
+        )
+
+    def _show_opponent_ready_popup(self) -> None:
+        self._clear_hover()
+        self.board_overlay.show(
+            OverlayOptions(
+                title="Player Ready",
+                message="상대 플레이어가 Ready 상태입니다.",
+                kind="info",
+                dismiss_on_click=True,
+                dismiss_hint="클릭하면 닫힙니다",
+                content_tag="player_ready_overlay",
+            )
+        )
+
+    def _dismiss_forbidden_popup(self) -> None:
+        self._cancel_forbidden_flash()
+        self.state.rejected_point = None
+        if self.state.view_state == IN_ROOM:
+            self._draw_board()
+
+    def _dismiss_result_popup(self) -> None:
+        self._result_popup_dismissed = True
+
+    def _reset_board_popup(self) -> None:
+        self.board_overlay.clear()
+        self._clear_ready_state()
+        self._clear_undo_state()
+        self._result_popup_dismissed = False
 
     def _sync_forbidden_flash(self) -> None:
         """Let a rejected point fade on its own instead of sticking."""
@@ -797,7 +1075,9 @@ class OmokApp:
             self._connecting = False
             self._clear_hover()
             self.state.reset_connection()
+            self._reset_board_popup()
             self._clear_pending_requests()
+            self.turn_timer.deactivate()
             if not self._closing and not self.message_var.get().startswith("Connection lost"):
                 self.message_var.set(event.message)
         elif event.kind in {"network_error", "protocol_error"}:
@@ -812,6 +1092,7 @@ class OmokApp:
 
     def _handle_server_message(self, payload: dict[str, object]) -> None:
         message_type = payload.get("type")
+        was_finished = self.state.is_finished
         if message_type in {
             "joined",
             "left_room",
@@ -820,7 +1101,13 @@ class OmokApp:
             "game_over",
             "game_state",
             "player_disconnected",
-            "restart",
+            "player_ready",
+            "ready_confirmed",
+            "role_changed",
+            "room_members",
+            "undo_requested",
+            "undo_result",
+            "turn_timeout",
         }:
             self._clear_hover()
         try:
@@ -830,29 +1117,125 @@ class OmokApp:
             self.message_var.set(f"Invalid server message: {exc}")
             return
 
-        self.message_var.set(change.message)
+        is_forbidden_error = (
+            message_type == "error" and payload.get("code") == "FORBIDDEN_MOVE"
+        )
+        if is_forbidden_error:
+            self.message_var.set(self.state.turn_message())
+        else:
+            self.message_var.set(change.message)
         if message_type == "connected":
             self.network.request_room_list()
         elif message_type == "room_list":
             self._render_room_list()
         elif message_type == "joined":
+            self._reset_board_popup()
             self._room_request_pending = False
             self._leave_pending = False
-            self._restart_pending = False
+            self._ready_request_pending = False
+            self._role_change_pending = False
             self._move_pending = False
+            self.turn_timer.deactivate()
         elif message_type == "left_room":
+            self._reset_board_popup()
             self._leave_pending = False
-            self._restart_pending = False
+            self._ready_request_pending = False
+            self._role_change_pending = False
             self._move_pending = False
+            self.turn_timer.deactivate()
             self.network.request_room_list()
         elif message_type == "error":
             self._clear_pending_requests()
             self._sync_forbidden_flash()
+            if is_forbidden_error:
+                self._show_forbidden_popup(change.message)
+        elif message_type == "game_start":
+            self._reset_board_popup()
+            self._sync_turn_timer_from_state()
+        elif message_type == "player_disconnected":
+            self._reset_board_popup()
+            self.turn_timer.deactivate()
+        elif message_type == "role_changed":
+            self._role_change_pending = False
+            self._clear_ready_state()
+            self.board_overlay.clear()
+        elif message_type == "room_members":
+            if not self.state.my_ready:
+                self.ready_blocking_overlay.clear_from_system()
+        elif message_type == "ready_confirmed":
+            self._ready_request_pending = False
+            if self.state.is_finished:
+                self._result_popup_dismissed = True
+                self.board_overlay.clear()
+            self.ready_blocking_overlay.show_blocking(
+                "Ready",
+                "상대 플레이어의 Ready를 기다리고 있습니다.",
+            )
+        elif message_type == "player_ready":
+            if self.state.is_finished:
+                self._result_popup_dismissed = True
+                self.board_overlay.clear()
+            self._show_opponent_ready_popup()
         elif message_type in {"move_result", "game_state", "game_over"}:
             self._move_pending = False
-        elif message_type == "restart":
-            self._restart_pending = False
+            if message_type == "game_state" and self._undo_waiting_for_game_state:
+                self._clear_undo_state()
+                self._show_undo_result_popup(accepted=True)
+            if self.state.is_finished and not was_finished:
+                self._result_popup_dismissed = False
+            if message_type == "move_result" and self.board_overlay.kind == "warning":
+                self.board_overlay.clear()
+            if message_type == "game_state":
+                self._sync_turn_timer_from_state()
+            elif message_type == "game_over":
+                self.turn_timer.deactivate()
+        elif message_type == "turn_timeout":
             self._move_pending = False
+            self.turn_timer.synchronize(
+                self.state.turn_time_limit_sec,
+                None,
+                self.state.turn_revision,
+            )
+        elif message_type == "undo_requested":
+            self._undo_pending = True
+            self._undo_waiting_for_game_state = False
+            self.turn_timer.pause()
+            requester_color = payload.get("requester_color")
+            if requester_color == self.state.my_color:
+                self.undo_action_overlay.clear()
+                self.undo_blocking_overlay.show_blocking(
+                    "착수 되돌리기",
+                    "상대방의 응답을 기다리는 중입니다.",
+                )
+            else:
+                undo_count = payload.get("undo_count")
+                self.undo_blocking_overlay.clear_from_system()
+                self.undo_action_overlay.show_actions(
+                    "착수 되돌리기 요청",
+                    f"상대방이 {undo_count}수 되돌리기를 요청했습니다.",
+                    (
+                        OverlayAction("수락", lambda: self._respond_undo(True)),
+                        OverlayAction("거절", lambda: self._respond_undo(False)),
+                    ),
+                    kind="warning",
+                )
+        elif message_type == "undo_result":
+            accepted = payload.get("accepted") is True
+            self.turn_timer.pause()
+            self.undo_action_overlay.clear()
+            if accepted:
+                self._undo_pending = True
+                self._undo_waiting_for_game_state = True
+                self.undo_blocking_overlay.show_blocking(
+                    "착수 되돌리기",
+                    "변경된 대국 상태를 동기화하는 중입니다.",
+                )
+            else:
+                self._clear_undo_state()
+                self._show_undo_result_popup(
+                    accepted=False,
+                    requested_by_me=payload.get("requester_color") == self.state.my_color,
+                )
         if change.redraw_board and self.state.view_state == IN_ROOM:
             self._draw_board()
         if not change.handled:
@@ -884,12 +1267,16 @@ class OmokApp:
             card.destroy()
         self.room_cards.clear()
         for room in self.state.rooms:
+            timer_text = self._room_timer_text(room)
             card = tk.Button(
                 self.room_grid,
                 text=(
                     f"{room.room_name}\n"
-                    f"{room.game_type.label} · {room.board_size} × {room.board_size}\n"
-                    f"{room.players} / {room.max_players} · {room.status}"
+                    f"{room.game_type.label} · {room.board_size} × {room.board_size}"
+                    f"{timer_text}\n"
+                    f"Members {room.players}/{room.max_players} · {room.status}\n"
+                    f"Players {room.player_count}/{room.max_game_players} · "
+                    f"Observers {room.observer_count}"
                 ),
                 image=self._stone_images[BLACK],
                 compound="top",
@@ -916,6 +1303,14 @@ class OmokApp:
         else:
             self.lobby_empty_label.grid()
         self._render_controls()
+
+    @staticmethod
+    def _room_timer_text(room: RoomSummary) -> str:
+        if room.game_type is not GameType.GOMOKU:
+            return ""
+        if room.turn_time_limit_sec is None:
+            return " · Infinite"
+        return f" · {room.turn_time_limit_sec} sec"
 
     def _layout_room_cards(self, available_width: int) -> None:
         columns = max(1, available_width // 220) if available_width > 1 else 3
@@ -947,6 +1342,12 @@ class OmokApp:
         self.room_var.set(self.state.room_name or self.state.room_id or "-")
         self.game_type_var.set(self.state.game_type.label if self.state.game_type else "-")
         self.you_var.set(self.state.my_color or "-")
+        role = self.state.my_role or "-"
+        color = f" / {self.state.my_color.title()}" if self.state.my_color else ""
+        self.role_var.set(
+            f"Role: {role.title()}{color} · "
+            f"Players {self.state.player_count}/2 · Observers {self.state.observer_count}"
+        )
         self.turn_var.set(self.state.current_turn or "-")
         self.you_stone_label.configure(
             image=self._stone_images.get(self.state.my_color, self._stone_images[None])
@@ -1006,17 +1407,58 @@ class OmokApp:
             card.configure(state="disabled" if self._create_room_modal_open else "normal")
         self.leave_room_button.configure(
             state="normal"
-            if self.state.view_state == IN_ROOM and not self._leave_pending
+            if (
+                self.state.view_state == IN_ROOM
+                and not self._leave_pending
+                and not (
+                    self.state.my_role == PLAYER
+                    and self.state.game_status == "PLAYING"
+                )
+            )
             else "disabled"
         )
-        self.restart_button.configure(
-            state="normal"
-            if self.state.view_state == IN_ROOM
+        can_ready = (
+            self.state.view_state == IN_ROOM
             and self.state.connected
-            and self.state.is_finished
-            and not self._restart_pending
-            else "disabled"
+            and self.state.game_status in {"WAITING", "FINISHED"}
+            and self.state.my_role == PLAYER
+            and self.state.player_count == 2
+            and not self.state.my_ready
+            and not self._ready_request_pending
+            and not self._undo_pending
         )
+        self.ready_button.configure(state="normal" if can_ready else "disabled")
+        can_become_player = (
+            self.state.view_state == IN_ROOM
+            and self.state.connected
+            and self.state.my_role == OBSERVER
+            and self.state.game_status != "PLAYING"
+            and self.state.player_count < 2
+            and not self._role_change_pending
+        )
+        self.become_player_button.configure(
+            state="normal" if can_become_player else "disabled"
+        )
+        can_become_observer = (
+            self.state.view_state == IN_ROOM
+            and self.state.connected
+            and self.state.my_role == PLAYER
+            and self.state.game_status != "PLAYING"
+            and not self._role_change_pending
+        )
+        self.become_observer_button.configure(
+            state="normal" if can_become_observer else "disabled"
+        )
+        can_undo = (
+            self.state.view_state == IN_ROOM
+            and self.state.connected
+            and self.state.game_type is GameType.GOMOKU
+            and self.state.my_role == PLAYER
+            and self.state.game_status == "PLAYING"
+            and self.state.has_accepted_move
+            and not self._undo_pending
+        )
+        self.undo_button.configure(state="normal" if can_undo else "disabled")
 
     def _geometry(self) -> BoardGeometry | OthelloBoardGeometry:
         width = self.canvas.winfo_width()
@@ -1047,8 +1489,8 @@ class OmokApp:
         self._draw_forbidden_moves(geometry)
         self._draw_legal_moves(geometry)
         self._draw_stones(geometry)
-        self._draw_result_overlay(geometry)
         self._render_preview(geometry)
+        self._render_board_overlay()
 
     def _draw_grid(self, geometry: BoardGeometry | OthelloBoardGeometry) -> None:
         if isinstance(geometry, OthelloBoardGeometry):
@@ -1213,7 +1655,12 @@ class OmokApp:
             self.canvas.delete(self._preview_item_id)
             self._preview_item_id = None
         coordinate = self.hover_position
-        if coordinate is None or self._move_pending or not self.state.can_move(*coordinate):
+        if (
+            coordinate is None
+            or self._move_pending
+            or self._turn_timer_display_expired
+            or not self.state.can_move(*coordinate)
+        ):
             self.hover_position = None
             return
         cx, cy = geometry.board_to_pixel(*coordinate)
@@ -1231,39 +1678,22 @@ class OmokApp:
             tags=("preview",),
         )
 
-    def _draw_result_overlay(
-        self, geometry: BoardGeometry | OthelloBoardGeometry
-    ) -> None:
-        if not self.state.is_finished:
-            return
-        center_x = (geometry.origin_x + geometry.end_x) / 2
-        center_y = (geometry.origin_y + geometry.end_y) / 2
-        board_pixel_size = geometry.end_x - geometry.origin_x
-        panel_width = min(640.0, max(320.0, board_pixel_size * 0.78))
-        panel_height = min(190.0, max(120.0, board_pixel_size * 0.22))
-        font_size = min(
-            44, max(26, int(min(geometry.canvas_width, geometry.canvas_height) * 0.055))
-        )
-        self.canvas.create_rectangle(
-            center_x - panel_width / 2,
-            center_y - panel_height / 2,
-            center_x + panel_width / 2,
-            center_y + panel_height / 2,
-            fill="#F8E8C8",
-            outline="#7B542B",
-            width=3,
-            tags=("result_overlay",),
-        )
-        self.canvas.create_text(
-            center_x,
-            center_y,
-            text=self.state.build_game_over_message(),
-            fill="#5A2018",
-            font=("TkDefaultFont", font_size, "bold"),
-            width=panel_width - 36,
-            justify="center",
-            tags=("result_overlay",),
-        )
+    def _render_board_overlay(self) -> None:
+        if self.state.is_finished and not self._result_popup_dismissed:
+            self.board_overlay.show(
+                OverlayOptions(
+                    title="게임 종료",
+                    message=self.state.build_game_over_message(),
+                    kind="result",
+                    content_tag="result_overlay",
+                ),
+                on_dismiss=self._dismiss_result_popup,
+            )
+        else:
+            self.board_overlay.redraw()
+        self.ready_blocking_overlay.redraw()
+        self.undo_blocking_overlay.redraw()
+        self.undo_action_overlay.redraw()
 
     def _on_close(self) -> None:
         if self._closing:
@@ -1276,5 +1706,9 @@ class OmokApp:
             self.root.after_cancel(self._resize_after_id)
             self._resize_after_id = None
         self._cancel_forbidden_flash()
+        self.board_overlay.clear()
+        self._clear_ready_state()
+        self._clear_undo_state()
+        self.turn_timer.close()
         self.network.shutdown()
         self.root.destroy()

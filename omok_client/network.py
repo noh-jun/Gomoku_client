@@ -60,11 +60,19 @@ class NetworkClient:
     def request_room_list(self) -> None:
         self._submit_send(encode_message("get_room_list"))
 
-    def create_room(self, room_name: str, game_type: GameType) -> None:
+    def create_room(
+        self,
+        room_name: str,
+        game_type: GameType,
+        turn_time_limit_sec: int | None = None,
+    ) -> None:
         game_type = GameType.from_wire(game_type)
         self._submit_send(
             encode_message(
-                "create_room", room_name=room_name, game_type=game_type.value
+                "create_room",
+                room_name=room_name,
+                game_type=game_type.value,
+                turn_time_limit_sec=turn_time_limit_sec,
             )
         )
 
@@ -74,8 +82,20 @@ class NetworkClient:
     def leave_room(self) -> None:
         self._submit_send(encode_message("leave_room"))
 
-    def request_restart(self) -> None:
-        self._submit_send(encode_message("restart_request"))
+    def become_player(self) -> None:
+        self._submit_send(encode_message("become_player"))
+
+    def become_observer(self) -> None:
+        self._submit_send(encode_message("become_observer"))
+
+    def send_ready(self) -> None:
+        self._submit_send(encode_message("ready"))
+
+    def request_undo(self) -> None:
+        self._submit_send(encode_message("undo_request"))
+
+    def respond_undo(self, accepted: bool) -> None:
+        self._submit_send(encode_message("undo_response", accepted=accepted))
 
     def ping(self) -> None:
         self._submit_send(encode_message("ping"))

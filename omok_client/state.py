@@ -19,12 +19,16 @@ VALID_COLORS = {BLACK, WHITE}
 DISCONNECTED = "DISCONNECTED"
 LOBBY = "LOBBY"
 IN_ROOM = "IN_ROOM"
+PLAYER = "PLAYER"
+OBSERVER = "OBSERVER"
+VALID_ROLES = {PLAYER, OBSERVER}
 FORBIDDEN_LABELS = {
     "DOUBLE_THREE": "3-3 금수",
     "DOUBLE_FOUR": "4-4 금수",
     "OVERLINE": "장목 금수",
 }
 FORBIDDEN_TYPES = frozenset(FORBIDDEN_LABELS)
+SUPPORTED_TURN_TIME_LIMITS = frozenset({5, 10, 15, 30, 60})
 
 
 def new_board(board_size: int = DEFAULT_BOARD_SIZE) -> list[list[str | None]]:
@@ -52,11 +56,15 @@ class RoomSummary:
     win_length: int | None
     players: int
     max_players: int
+    player_count: int
+    max_game_players: int
+    observer_count: int
+    turn_time_limit_sec: int | None
     status: str
 
     @property
     def can_join(self) -> bool:
-        return self.players < self.max_players and self.status == "WAITING"
+        return self.players < self.max_players
 
 
 @dataclass
@@ -70,6 +78,9 @@ class AppState:
         default_factory=lambda: {GameType.GOMOKU}
     )
     my_color: str | None = None
+    my_role: str | None = None
+    player_count: int = 0
+    observer_count: int = 0
     starting_color: str | None = None
     board_size: int = DEFAULT_BOARD_SIZE
     win_length: int | None = DEFAULT_WIN_LENGTH
@@ -87,6 +98,10 @@ class AppState:
     legal_moves: set[tuple[int, int]] = field(default_factory=set)
     score: dict[str, int] = field(default_factory=new_score)
     passed_color: str | None = None
+    ready_colors: set[str] = field(default_factory=set)
+    turn_time_limit_sec: int | None = None
+    turn_deadline_unix_ms: int | None = None
+    turn_revision: int = 0
 
     def __post_init__(self) -> None:
         effective_type = self.game_type or GameType.GOMOKU
@@ -99,6 +114,7 @@ class AppState:
         self.score = _validated_score(self.score)
         self.legal_moves = set(self.legal_moves)
         self.forbidden_moves = dict(self.forbidden_moves)
+        self.ready_colors = set(self.ready_colors)
 
     def apply_board_settings(
         self,
@@ -123,6 +139,9 @@ class AppState:
         self.room_name = None
         self.game_type = None
         self.my_color = None
+        self.my_role = None
+        self.player_count = 0
+        self.observer_count = 0
         self.starting_color = None
         self.board_size = DEFAULT_BOARD_SIZE
         self.win_length = DEFAULT_WIN_LENGTH
@@ -139,6 +158,10 @@ class AppState:
         self.legal_moves.clear()
         self.score = new_score()
         self.passed_color = None
+        self.ready_colors.clear()
+        self.turn_time_limit_sec = None
+        self.turn_deadline_unix_ms = None
+        self.turn_revision = 0
 
     def reset_connection(self) -> None:
         self.connected = False
@@ -179,6 +202,19 @@ class AppState:
     def is_finished(self) -> bool:
         return self.game_status in {"FINISHED", "GAME_OVER"}
 
+    @property
+    def has_accepted_move(self) -> bool:
+        return any(cell is not EMPTY for row in self.board for cell in row)
+
+    @property
+    def my_ready(self) -> bool:
+        return self.my_color is not None and self.my_color in self.ready_colors
+
+    @property
+    def opponent_ready(self) -> bool:
+        opponent = WHITE if self.my_color == BLACK else BLACK
+        return self.my_color is not None and opponent in self.ready_colors
+
     def apply_server_message(self, data: dict[str, Any]) -> StateChange:
         message_type = data.get("type")
 
@@ -206,18 +242,27 @@ class AppState:
             game_type = _message_game_type(data, None)
             room_id = _required_room_id(data, "joined")
             room_name = _room_name_from_message(data, room_id)
-            color = _required_color(data, "your_color")
+            role = _required_role(data, "your_role")
+            color = _optional_color(data, "your_color", None)
+            if role == OBSERVER and color is not None:
+                raise ValueError("An observer must have null your_color")
+            if role == PLAYER and color is None:
+                raise ValueError("A player must have BLACK or WHITE your_color")
             board_size, win_length = _settings_from_message(
                 data, game_type, DEFAULT_BOARD_SIZE, DEFAULT_WIN_LENGTH
             )
             starting_color = _validated_starting_color(
                 game_type, data, self.starting_color
             )
+            turn_time_limit_sec = _turn_time_limit_from_message(
+                data, game_type, None
+            )
             self.room_id = room_id
             self.room_name = room_name
             self.game_type = game_type
             self.view_state = IN_ROOM
             self.my_color = color
+            self.my_role = role
             self.starting_color = starting_color
             self.board_size = board_size
             self.win_length = win_length
@@ -226,8 +271,12 @@ class AppState:
             self.legal_moves.clear()
             self.score = new_score()
             self.passed_color = None
+            self.ready_colors.clear()
+            self.turn_time_limit_sec = turn_time_limit_sec
+            self.turn_deadline_unix_ms = None
+            self.turn_revision = 0
             self.game_status = "WAITING"
-            return StateChange(True, "Waiting for opponent...", True)
+            return StateChange(True, "Joined as observer.", True)
 
         if message_type == "left_room":
             room_id = data.get("room_id")
@@ -242,15 +291,75 @@ class AppState:
                 True, f"{color.title()} player joined. Waiting for game start..."
             )
 
+        if message_type == "role_changed":
+            role = _required_role(data, "your_role")
+            color = _optional_color(data, "your_color", None)
+            if role == PLAYER and color is None:
+                raise ValueError("A player must have BLACK or WHITE your_color")
+            if role == OBSERVER and color is not None:
+                raise ValueError("An observer must have null your_color")
+            self.my_role = role
+            self.my_color = color
+            if role == OBSERVER:
+                self.ready_colors.clear()
+            return StateChange(True, f"Role changed to {role.title()}.", True)
+
+        if message_type == "room_members":
+            player_count = _required_count(data, "player_count", 2)
+            observer_count = _required_count(data, "observer_count", 99)
+            member_count = _required_count(data, "member_count", 99)
+            if player_count + observer_count != member_count:
+                raise ValueError("room_members counts do not add up")
+            ready = data.get("ready_colors")
+            if not isinstance(ready, list) or any(color not in VALID_COLORS for color in ready):
+                raise ValueError("room_members.ready_colors must contain valid colors")
+            if len(set(ready)) != len(ready) or len(ready) > player_count:
+                raise ValueError("room_members.ready_colors is invalid")
+            self.player_count = player_count
+            self.observer_count = observer_count
+            self.ready_colors = set(ready)
+            return StateChange(True, f"Room members updated ({member_count}/99).")
+
+        if message_type == "ready_confirmed":
+            if data.get("ready") is not True:
+                raise ValueError("ready_confirmed.ready must be true")
+            if self.my_role != PLAYER or self.my_color is None:
+                raise ValueError("Only a player can be confirmed ready")
+            self.ready_colors.add(self.my_color)
+            return StateChange(True, "Ready confirmed. Waiting for the other player.")
+
+        if message_type == "player_ready":
+            color = _required_color(data, "color")
+            ready_count = data.get("ready_count")
+            required = data.get("required")
+            if isinstance(ready_count, bool) or not isinstance(ready_count, int):
+                raise ValueError("player_ready.ready_count must be an integer")
+            if isinstance(required, bool) or not isinstance(required, int):
+                raise ValueError("player_ready.required must be an integer")
+            if required != 2 or not 1 <= ready_count <= required:
+                raise ValueError("player_ready progress is invalid")
+            self.ready_colors.add(color)
+            return StateChange(
+                True, f"{color.title()} is ready ({ready_count}/{required})."
+            )
+
         if message_type == "game_start":
             game_type = _message_game_type(data, self.game_type)
             current_turn = _required_color(data, "current_turn")
-            my_color = _optional_color(data, "your_color", self.my_color)
+            role = _required_role(data, "your_role")
+            my_color = _optional_color(data, "your_color", None)
+            if role == PLAYER and my_color is None:
+                raise ValueError("A player must have BLACK or WHITE your_color")
+            if role == OBSERVER and my_color is not None:
+                raise ValueError("An observer must have null your_color")
             board_size, win_length = _settings_from_message(
                 data, game_type, self.board_size, self.win_length
             )
             starting_color = _validated_starting_color(
                 game_type, data, current_turn
+            )
+            turn_time_limit_sec = _turn_time_limit_from_message(
+                data, game_type, self.turn_time_limit_sec
             )
             board = (
                 _validated_board(data["board"], board_size)
@@ -274,6 +383,7 @@ class AppState:
             self.last_move = None
             self.current_turn = current_turn
             self.my_color = my_color
+            self.my_role = role
             self.starting_color = starting_color
             self.game_status = "PLAYING"
             self.winner = None
@@ -285,6 +395,9 @@ class AppState:
             self.legal_moves = legal_moves
             self.score = score
             self.passed_color = None
+            self.ready_colors.clear()
+            self.turn_time_limit_sec = turn_time_limit_sec
+            self.turn_deadline_unix_ms = None
             return StateChange(True, self.turn_message(), True)
 
         if message_type == "move_result":
@@ -332,6 +445,7 @@ class AppState:
             self.score = score
             self.game_status = "FINISHED"
             self.current_turn = None
+            self.turn_deadline_unix_ms = None
             self.legal_moves.clear()
             self.forbidden_moves.clear()
             self.rejected_point = None
@@ -360,6 +474,18 @@ class AppState:
                 game_type, data, self.starting_color
             )
             game_over_reason = _optional_string(data, "game_over_reason")
+            turn_time_limit_sec = _turn_time_limit_from_message(
+                data, game_type, self.turn_time_limit_sec
+            )
+            turn_deadline_unix_ms = _optional_non_negative_integer(
+                data, "turn_deadline_unix_ms"
+            )
+            turn_revision = _non_negative_integer(
+                data.get("turn_revision", self.turn_revision),
+                "game_state.turn_revision",
+            )
+            if game_type is GameType.OTHELLO and turn_deadline_unix_ms is not None:
+                raise ValueError("Othello game_state must not contain a turn deadline")
             if game_type is GameType.OTHELLO:
                 score = _validated_score(data.get("score"))
                 legal_moves = _validated_legal_moves(
@@ -393,11 +519,18 @@ class AppState:
             self.constrained_color = constrained_color
             self.forbidden_moves = forbidden_moves
             self.last_move = last_move
+            self.turn_time_limit_sec = turn_time_limit_sec
+            if turn_revision >= self.turn_revision:
+                self.turn_deadline_unix_ms = turn_deadline_unix_ms
+                self.turn_revision = turn_revision
+            if normalized_status != "PLAYING":
+                self.turn_deadline_unix_ms = None
             return StateChange(True, self.status_message(), True)
 
         if message_type == "player_disconnected":
             color = _required_color(data, "color")
             self.current_turn = None
+            self.turn_deadline_unix_ms = None
             self.game_status = "WAITING"
             self.winner = None
             self.loser = None
@@ -406,54 +539,69 @@ class AppState:
             self.forbidden_moves.clear()
             self.rejected_point = None
             self.passed_color = None
+            self.ready_colors.clear()
             return StateChange(
                 True, f"{color.title()} player left. Waiting for opponent..."
             )
 
-        if message_type == "restart":
+        if message_type == "undo_requested":
             game_type = _message_game_type(data, self.game_type)
+            if game_type is not GameType.GOMOKU:
+                raise ValueError("undo_requested.game_type must be GOMOKU")
+            requester_color = _required_color(data, "requester_color")
+            undo_count = data.get("undo_count")
+            if isinstance(undo_count, bool) or undo_count not in {1, 2}:
+                raise ValueError("undo_requested.undo_count must be 1 or 2")
+            requester = "You" if requester_color == self.my_color else "Opponent"
+            self.turn_deadline_unix_ms = None
+            return StateChange(
+                True,
+                f"{requester} requested undo of {undo_count} move(s).",
+            )
+
+        if message_type == "turn_timeout":
+            game_type = _message_game_type(data, self.game_type)
+            if game_type is not GameType.GOMOKU:
+                raise ValueError("turn_timeout.game_type must be GOMOKU")
+            if self.game_type is not None and game_type is not self.game_type:
+                raise ValueError("turn_timeout.game_type does not match current room")
+            timed_out_color = _required_color(data, "timed_out_color")
             current_turn = _required_color(data, "current_turn")
-            my_color = _optional_color(data, "your_color", self.my_color)
-            board_size, win_length = _settings_from_message(
-                data, game_type, self.board_size, self.win_length
-            )
-            starting_color = _validated_starting_color(
-                game_type, data, current_turn
-            )
-            board = (
-                _validated_board(data["board"], board_size)
-                if "board" in data
-                else new_board(board_size)
-            )
-            score = (
-                _validated_score(data["score"])
-                if "score" in data
-                else new_score()
-            )
-            legal_moves = (
-                _validated_legal_moves(data["legal_moves"], board_size, board)
-                if "legal_moves" in data
-                else set()
-            )
-            self.game_type = game_type
-            self.board_size = board_size
-            self.win_length = win_length
-            self.board = board
+            if current_turn == timed_out_color:
+                raise ValueError("turn_timeout must switch to the other color")
             self.current_turn = current_turn
-            self.my_color = my_color
-            self.starting_color = starting_color
-            self.winner = None
-            self.loser = None
-            self.game_over_reason = None
-            self.constrained_color = None
-            self.forbidden_moves.clear()
-            self.rejected_point = None
-            self.game_status = "PLAYING"
-            self.last_move = None
-            self.score = score
-            self.legal_moves = legal_moves
-            self.passed_color = None
-            return StateChange(True, self.turn_message(), True)
+            self.turn_deadline_unix_ms = None
+            return StateChange(
+                True,
+                f"{timed_out_color.title()}'s turn timed out.",
+            )
+
+        if message_type == "undo_result":
+            game_type = _message_game_type(data, self.game_type)
+            if game_type is not GameType.GOMOKU:
+                raise ValueError("undo_result.game_type must be GOMOKU")
+            accepted = data.get("accepted")
+            if not isinstance(accepted, bool):
+                raise ValueError("undo_result.accepted must be a boolean")
+            _required_color(data, "requester_color")
+            _required_color(data, "current_turn")
+            undone = data.get("undone")
+            if not isinstance(undone, list):
+                raise ValueError("undo_result.undone must be a list")
+            for index, move in enumerate(undone):
+                if not isinstance(move, dict):
+                    raise ValueError(f"undo_result.undone[{index}] must be an object")
+                _required_coordinate(move, "x", self.board_size)
+                _required_coordinate(move, "y", self.board_size)
+                _required_color(move, "color")
+            if not accepted and undone:
+                raise ValueError("A rejected undo_result must have an empty undone list")
+            message = (
+                "Undo accepted. Synchronizing game state..."
+                if accepted
+                else "Undo request was rejected."
+            )
+            return StateChange(True, message)
 
         if message_type == "error":
             text = data.get("message")
@@ -483,6 +631,21 @@ class AppState:
                     "POSITION_OCCUPIED": "이미 돌이 있는 위치입니다.",
                     "GAME_NOT_STARTED": "아직 게임이 시작되지 않았습니다.",
                     "GAME_ALREADY_FINISHED": "이미 종료된 게임입니다.",
+                    "UNDO_NOT_AVAILABLE": "되돌릴 수 있는 착수가 없습니다.",
+                    "UNDO_ALREADY_PENDING": "이미 처리 중인 되돌리기 요청이 있습니다.",
+                    "UNDO_PENDING": "되돌리기 요청을 처리하는 동안에는 진행할 수 없습니다.",
+                    "NOT_UNDO_RESPONDER": "상대방만 되돌리기 요청에 응답할 수 있습니다.",
+                    "UNSUPPORTED_GAME_OPERATION": "현재 게임에서는 되돌리기를 지원하지 않습니다.",
+                    "READY_NOT_AVAILABLE": "현재는 Ready할 수 없습니다.",
+                    "READY_REQUIRES_TWO_PLAYERS": "상대 플레이어가 입장해야 Ready할 수 있습니다.",
+                    "PLAYER_REQUIRED": "Player만 사용할 수 있는 기능입니다.",
+                    "PLAYER_SLOTS_FULL": "Player 자리가 모두 사용 중입니다.",
+                    "ALREADY_PLAYER": "이미 Player 상태입니다.",
+                    "ALREADY_OBSERVER": "이미 Observer 상태입니다.",
+                    "ROLE_CHANGE_NOT_AVAILABLE": "게임 진행 중에는 역할을 변경할 수 없습니다.",
+                    "INVALID_TURN_TIME_LIMIT": "지원하지 않는 착수 제한 시간입니다.",
+                    "UNSUPPORTED_GAME_OPTION": "현재 게임에서는 해당 방 설정을 지원하지 않습니다.",
+                    "TURN_EXPIRED": "착수 제한 시간이 지나 해당 수가 반영되지 않았습니다.",
                 }
                 detail = localized.get(code, f"{detail} [{code}]")
             return StateChange(True, detail)
@@ -500,9 +663,15 @@ class AppState:
             )
         if self.current_turn is None:
             return "Waiting for turn information..."
+        if self.my_role == OBSERVER:
+            return f"Observing. {self.current_turn.title()}'s turn."
         return "Your turn." if self.current_turn == self.my_color else "Opponent's turn."
 
     def build_game_over_message(self) -> str:
+        if self.my_role == OBSERVER:
+            if self.winner in VALID_COLORS:
+                return f"{self.winner.title()} 승리"
+            return "무승부입니다."
         if self.game_type is GameType.OTHELLO:
             if self.winner is None:
                 title = "Draw"
@@ -572,6 +741,38 @@ def _settings_from_message(
     return board_size, win_length
 
 
+def _turn_time_limit_from_message(
+    data: dict[str, Any],
+    game_type: GameType,
+    fallback: int | None,
+) -> int | None:
+    value = data.get("turn_time_limit_sec", fallback)
+    if value is not None and (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or value not in SUPPORTED_TURN_TIME_LIMITS
+    ):
+        raise ValueError("turn_time_limit_sec must be 5, 10, 15, 30, 60, or null")
+    if game_type is GameType.OTHELLO and value is not None:
+        raise ValueError("OTHELLO does not support a turn timer")
+    return value
+
+
+def _non_negative_integer(value: Any, context: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"{context} must be a non-negative integer")
+    return value
+
+
+def _optional_non_negative_integer(
+    data: dict[str, Any], field_name: str
+) -> int | None:
+    value = data.get(field_name)
+    if value is None:
+        return None
+    return _non_negative_integer(value, f"game_state.{field_name}")
+
+
 def _validate_game_settings(
     game_type: GameType, board_size: Any, win_length: Any
 ) -> None:
@@ -611,6 +812,20 @@ def _validated_starting_color(
     value = _optional_color(data, "starting_color", fallback)
     if game_type is GameType.OTHELLO and value != BLACK:
         raise ValueError("OTHELLO starting_color must be BLACK")
+    return value
+
+
+def _required_role(data: dict[str, Any], field_name: str) -> str:
+    value = data.get(field_name)
+    if value not in VALID_ROLES:
+        raise ValueError(f"{field_name} must be PLAYER or OBSERVER")
+    return value
+
+
+def _required_count(data: dict[str, Any], field_name: str, maximum: int) -> int:
+    value = data.get(field_name)
+    if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= maximum:
+        raise ValueError(f"{field_name} must be an integer from 0 to {maximum}")
     return value
 
 
@@ -799,8 +1014,12 @@ def _validated_rooms(value: Any) -> list[RoomSummary]:
         board_size, win_length = _settings_from_message(
             item, game_type, default_size, default_win
         )
+        turn_time_limit_sec = _turn_time_limit_from_message(item, game_type, None)
         players = item.get("players")
         max_players = item.get("max_players")
+        player_count = item.get("player_count", players)
+        max_game_players = item.get("max_game_players", 2)
+        observer_count = item.get("observers", 0)
         status = item.get("status")
         if (
             isinstance(players, bool)
@@ -811,6 +1030,17 @@ def _validated_rooms(value: Any) -> list[RoomSummary]:
             or not 0 <= players <= max_players
         ):
             raise ValueError("Room player counts are invalid")
+        if (
+            isinstance(player_count, bool)
+            or not isinstance(player_count, int)
+            or isinstance(max_game_players, bool)
+            or not isinstance(max_game_players, int)
+            or not 0 <= player_count <= max_game_players
+            or isinstance(observer_count, bool)
+            or not isinstance(observer_count, int)
+            or observer_count < 0
+        ):
+            raise ValueError("Room role counts are invalid")
         if not isinstance(status, str) or not status:
             raise ValueError("Room status must be a non-empty string")
         seen_ids.add(room_id)
@@ -823,6 +1053,10 @@ def _validated_rooms(value: Any) -> list[RoomSummary]:
                 win_length=win_length,
                 players=players,
                 max_players=max_players,
+                player_count=player_count,
+                max_game_players=max_game_players,
+                observer_count=observer_count,
+                turn_time_limit_sec=turn_time_limit_sec,
                 status=status.upper(),
             )
         )

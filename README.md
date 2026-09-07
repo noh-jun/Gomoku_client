@@ -11,6 +11,7 @@ client/
 │   ├── main.py       # 프로그램 진입 및 로깅
 │   ├── board.py      # 동적 BoardGeometry와 양방향 좌표 변환
 │   ├── board_renderer.py # 오셀로 8×8 셀 중심 좌표
+│   ├── canvas_overlay.py # Canvas 기반 범용 클릭 해제 팝업
 │   ├── client_settings.py # 서버 주소 설정 파일 저장 및 로드
 │   ├── game_type.py  # GOMOKU/OTHELLO wire enum
 │   ├── protocol.py   # 클라이언트 JSON 인코딩/디코딩
@@ -88,6 +89,7 @@ ws://192.168.1.75:8000/ws
 - 오셀로 `move_result.flipped`는 서버가 지정한 셀을 즉시 갱신하고, 뒤이어 받은 authoritative `game_state`가 board·score·legal moves 전체를 교정합니다.
 - 선공 색상과 현재 턴은 서버의 `starting_color`, `current_turn`을 따르므로 WHITE 선공도 지원합니다. 종료 시 정상 승패·무승부 및 `DOUBLE_THREE`, `DOUBLE_FOUR`, `OVERLINE` 금수 원인을 메인 화면에 표시합니다.
 - 승패 또는 무승부가 확정되면 최종 보드를 유지한 채 결과를 보드 중앙에 표시합니다. 오목은 기존 금수 사유를, 오셀로는 서버 winner와 `Black n · White n` 점수를 표시합니다.
+- 보드 중앙 안내는 범용 `CanvasOverlay`를 사용합니다. 승패와 금수 착수 안내 팝업은 클릭하면 닫히며, 닫는 클릭은 착수 입력으로 전달되지 않습니다.
 - Restart 응답의 새로운 `your_color`를 즉시 적용하므로 라운드 사이 BLACK/WHITE 재배정과 새 색상 Preview를 지원합니다.
 - WebSocket 미연결 상태와 Lobby에서는 바둑판을 표시하지 않으며, `joined`로 Room 입장이 확정된 Game 화면에서만 표시합니다.
 - Connection 페이지에는 저장된 서버 주소를 사용하는 Connect 버튼과 우하단 설정 아이콘만 표시합니다. 설정은 별도 창이 아닌 Canvas 팝업에서 편집합니다. Lobby 페이지는 연결된 서버·Disconnect·Room 목록·Create·Join을, Game 페이지는 Room·You·Turn·Status·Board 설정·Restart·Leave Room·Disconnect를 소유합니다.
