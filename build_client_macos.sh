@@ -8,6 +8,9 @@ BUILD_ROOT="${CLIENT_DIR}/build/macos"
 BUILD_VENV="${BUILD_ROOT}/.venv"
 BUILD_PYTHON="${BUILD_VENV}/bin/python"
 DIST_DIR="${CLIENT_DIR}/dist/macos"
+APP_BUNDLE="${DIST_DIR}/OmokClient.app"
+ZIP_PATH="${DIST_DIR}/OmokClient.zip"
+DMG_PATH="${DIST_DIR}/OmokClient.dmg"
 
 if [[ "$(uname -s)" != "Darwin" ]]; then
     echo "[ERROR] This script must be run on macOS." >&2
@@ -51,6 +54,38 @@ echo "[INFO] Building OmokClient.app for $(uname -m)..."
     --specpath "${BUILD_ROOT}" \
     "${CLIENT_DIR}/client.py"
 
+echo "[INFO] Verifying the bundle before packaging..."
+codesign --verify --deep --strict "${APP_BUNDLE}"
+
+echo "[INFO] Packaging the bundle for distribution..."
+rm -f "${ZIP_PATH}" "${DMG_PATH}"
+
+# ditto preserves the bundle's symlinks, POSIX permissions and extended
+# attributes. Plain zip dereferences the symlinks and invalidates the code
+# signature, which makes macOS reject the copy the recipient receives.
+ditto -c -k --keepParent "${APP_BUNDLE}" "${ZIP_PATH}"
+
+hdiutil create \
+    -volname OmokClient \
+    -srcfolder "${APP_BUNDLE}" \
+    -ov \
+    -format UDZO \
+    -quiet \
+    "${DMG_PATH}"
+
 echo
 echo "[SUCCESS] Application bundle created:"
-echo "${DIST_DIR}/OmokClient.app"
+echo "${APP_BUNDLE}"
+echo
+echo "[SUCCESS] Distributable archives created:"
+echo "${DMG_PATH}"
+echo "${ZIP_PATH}"
+echo
+echo "[NOTE] Send the .dmg or the .zip as a single file."
+echo "       Uploading OmokClient.app itself to a file service stores it as a"
+echo "       folder, which drops the bundle's symlinks and executable bits."
+echo
+echo "[NOTE] This build is ad-hoc signed, so macOS quarantines it on delivery."
+echo "       Until it is signed with a Developer ID and notarized, the"
+echo "       recipient has to clear the quarantine flag once:"
+echo "         xattr -dr com.apple.quarantine /Applications/OmokClient.app"
