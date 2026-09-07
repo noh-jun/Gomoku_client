@@ -8,6 +8,7 @@ from tkinter import ttk
 
 from .board import BoardGeometry
 from .board_renderer import OthelloBoardGeometry
+from .account import normalize_account_id, validate_password
 from .canvas_overlay import (
     ActionModalOverlay,
     CanvasOverlay,
@@ -24,6 +25,8 @@ from .client_settings import (
 )
 from .game_type import GameType
 from .network import NetworkClient, NetworkEvent
+from .nickname import normalize_nickname
+from .room_member_list import RoomMemberList
 from .room_name import MAX_ROOM_NAME_LENGTH, normalize_room_name
 from .state import (
     AppState,
@@ -36,9 +39,14 @@ from .state import (
     RoomSummary,
     WHITE,
 )
+from .current_turn_widget import CurrentTurnWidget
+from .connection_view import ConnectionView
+from .create_account_view import CreateAccountView
+from .login_view import LoginView
 from .stone_image import create_stone_photo
 from .turn_timer import TurnTimer
 from .turn_timer_widget import TurnTimerWidget
+from .version import CLIENT_VERSION
 
 LOGGER = logging.getLogger(__name__)
 INITIAL_CANVAS_SIZE = 780
@@ -54,12 +62,14 @@ class OmokApp:
     def __init__(self, root: tk.Tk, settings_path: Path | None = None) -> None:
         self.root = root
         self.root.title("Online Gomoku & Othello")
-        self.root.geometry("900x950")
-        self.root.minsize(760, 720)
+        self.root.geometry("1120x950")
+        self.root.minsize(900, 720)
         self.state = AppState()
         self.events: Queue[NetworkEvent] = Queue()
         self.network = NetworkClient(self.events)
         self._connecting = False
+        self._account_request_pending = False
+        self._login_request_pending = False
         self._room_request_pending = False
         self._leave_pending = False
         self._ready_request_pending = False
@@ -68,35 +78,42 @@ class OmokApp:
         self._turn_timer_display_expired = False
         self._undo_pending = False
         self._undo_waiting_for_game_state = False
+        self._resign_pending = False
         self._result_popup_dismissed = False
         self._closing = False
+        self._pending_account_id: str | None = None
+        self._pending_account_password: str | None = None
         self._resize_after_id: str | None = None
         self._forbidden_flash_after_id: str | None = None
         self.hover_position: tuple[int, int] | None = None
         self._preview_item_id: int | None = None
-        self._selected_room_id: str | None = None
         self.room_cards: dict[str, tk.Button] = {}
         self._room_grid_column_count = 0
         self._create_room_modal_open = False
+        self._join_room_modal_open = False
+        self._join_room_id: str | None = None
+        self._join_room_name = ""
         self._settings_modal_open = False
+        self._authentication_view = "connection"
         self._settings_path = settings_path or default_settings_path()
         client_settings = load_client_settings(self._settings_path)
 
         self.server_var = tk.StringVar(value=client_settings.server_url)
-        self.room_var = tk.StringVar(value="-")
-        self.you_var = tk.StringVar(value="-")
-        self.turn_var = tk.StringVar(value="-")
-        self.status_var = tk.StringVar(value="Disconnected")
-        self.settings_var = tk.StringVar(value="Board: 15 x 15 / Win: 5")
-        self.game_type_var = tk.StringVar(value="-")
-        self.score_var = tk.StringVar(value="")
-        self.role_var = tk.StringVar(value="Role: -")
-        self.message_var = tk.StringVar(value="Connect to the server.")
+        self.message_var = tk.StringVar(value="Log in to continue.")
+        self.login_account_id_var = tk.StringVar(value=client_settings.account_id)
+        self.login_password_var = tk.StringVar(value=client_settings.password)
+        self.auto_login_var = tk.BooleanVar(value=client_settings.auto_login)
+        self.create_account_id_var = tk.StringVar()
+        self.create_account_password_var = tk.StringVar()
+        self.create_account_password_confirm_var = tk.StringVar()
+        self.create_account_nickname_var = tk.StringVar()
         self._create_room_name_var = tk.StringVar()
         self._create_room_error_var = tk.StringVar()
         self._create_room_game_type_var = tk.StringVar(value=GameType.GOMOKU.value)
         self._create_room_turn_time_var = tk.StringVar(value=INFINITE_TURN_TIME)
         self._settings_server_var = tk.StringVar(value=client_settings.server_url)
+        self._settings_account_id_var = tk.StringVar(value=client_settings.account_id)
+        self._settings_auto_login_var = tk.BooleanVar(value=client_settings.auto_login)
         self._settings_error_var = tk.StringVar()
         self._stone_images = {
             None: create_stone_photo(self.root, None),
@@ -109,6 +126,7 @@ class OmokApp:
         self._render_view()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.root.after(50, self._poll_network_events)
+        self.root.after(0, self._connect_to_server)
 
     def _build_ui(self) -> None:
         self.root.rowconfigure(0, weight=1)
@@ -124,6 +142,8 @@ class OmokApp:
         self.content_frame.columnconfigure(0, weight=1)
 
         self._build_connection_frame()
+        self._build_login_frame()
+        self._build_create_account_frame()
         self._build_lobby_frame()
         self._build_game_frame()
 
@@ -133,37 +153,16 @@ class OmokApp:
         footer.columnconfigure(0, weight=1)
 
     def _build_connection_frame(self) -> None:
-        self.connection_frame = ttk.Frame(self.content_frame, padding=30)
-        self.connection_frame.rowconfigure(0, weight=1)
-        self.connection_frame.rowconfigure(2, weight=1)
-        self.connection_frame.columnconfigure(0, weight=1)
-
-        self.connect_button = ttk.Button(
-            self.connection_frame,
-            text="Connect",
-            command=self._connect,
-            padding=(42, 16),
+        self.connection_frame = ConnectionView(
+            self.content_frame,
+            server_var=self.server_var,
+            on_retry=self._connect_to_server,
+            on_settings=self._open_settings_modal,
         )
-        self.connect_button.grid(row=1, column=0)
-        self.settings_button = tk.Button(
-            self.connection_frame,
-            text="⚙",
-            command=self._open_settings_modal,
-            font=("Segoe UI Symbol", 22),
-            foreground="#4B4033",
-            background="#F4E8D0",
-            activebackground="#E8D3AE",
-            relief="flat",
-            borderwidth=0,
-            padx=10,
-            pady=6,
-            cursor="hand2",
-            takefocus=True,
-        )
-        self.settings_button.grid(row=3, column=0, sticky="se")
+        self.settings_button = self.connection_frame.settings_button
 
         self.settings_modal_canvas = tk.Canvas(
-            self.connection_frame,
+            self.content_frame,
             background="#6B6258",
             highlightthickness=0,
             takefocus=True,
@@ -182,6 +181,11 @@ class OmokApp:
             foreground="#B42318",
             background="#FFF8EA",
             anchor="w",
+        )
+        self.settings_auto_login_check = ttk.Checkbutton(
+            self.settings_modal_canvas,
+            text="Auto Login",
+            variable=self._settings_auto_login_var,
         )
         self.settings_modal_cancel_button = ttk.Button(
             self.settings_modal_canvas,
@@ -203,6 +207,90 @@ class OmokApp:
             "<Return>", lambda _event: self._save_settings()
         )
 
+    def _build_login_frame(self) -> None:
+        self.login_frame = LoginView(
+            self.content_frame,
+            account_id_var=self.login_account_id_var,
+            password_var=self.login_password_var,
+            auto_login_var=self.auto_login_var,
+            on_login=self._login_view_submit,
+            on_create_account=self._show_create_account_view,
+            on_settings=self._open_settings_modal,
+        )
+        self.connect_button = self.login_frame.login_button
+
+    def _build_create_account_frame(self) -> None:
+        self.create_account_frame = CreateAccountView(
+            self.content_frame,
+            account_id_var=self.create_account_id_var,
+            password_var=self.create_account_password_var,
+            password_confirm_var=self.create_account_password_confirm_var,
+            nickname_var=self.create_account_nickname_var,
+            on_create=self._create_account_view_submit,
+            on_back=self._show_login_view,
+        )
+
+    def _show_create_account_view(self) -> None:
+        if not self.state.connected or self._account_request_pending:
+            return
+        self._authentication_view = "create_account"
+        self.message_var.set("Enter the account information.")
+        self._render_view()
+        self.create_account_frame.entries[0].focus_set()
+
+    def _show_login_view(self) -> None:
+        if self._account_request_pending:
+            return
+        self._authentication_view = "login"
+        self.message_var.set("Log in to continue.")
+        self._render_view()
+        self.login_frame.account_id_entry.focus_set()
+
+    def _login_view_submit(self) -> None:
+        if (
+            not self.state.connected
+            or self.state.view_state != DISCONNECTED
+            or self._login_request_pending
+            or self._account_request_pending
+        ):
+            return
+        try:
+            account_id = normalize_account_id(self.login_account_id_var.get())
+            password = validate_password(self.login_password_var.get())
+        except ValueError as exc:
+            self.message_var.set(str(exc))
+            return
+        self._login_request_pending = True
+        self.login_account_id_var.set(account_id)
+        self.network.login(account_id, password)
+        self.message_var.set("Logging in...")
+        self._render_controls()
+
+    def _create_account_view_submit(self) -> None:
+        if (
+            not self.state.connected
+            or self.state.view_state != DISCONNECTED
+            or self._account_request_pending
+        ):
+            return
+        try:
+            account_id = normalize_account_id(self.create_account_id_var.get())
+            password = validate_password(self.create_account_password_var.get())
+            if password != self.create_account_password_confirm_var.get():
+                raise ValueError("Password and Confirm Password do not match.")
+            nickname = normalize_nickname(self.create_account_nickname_var.get())
+        except ValueError as exc:
+            self.message_var.set(str(exc))
+            return
+
+        self._account_request_pending = True
+        self._pending_account_id = account_id
+        self._pending_account_password = password
+        self.create_account_id_var.set(account_id)
+        self.network.create_account(account_id, password, nickname)
+        self.message_var.set("Creating account...")
+        self._render_controls()
+
     def _build_lobby_frame(self) -> None:
         self.lobby_frame = ttk.LabelFrame(self.content_frame, text="Lobby", padding=10)
         self.lobby_frame.rowconfigure(1, weight=1)
@@ -210,8 +298,10 @@ class OmokApp:
 
         lobby_header = ttk.Frame(self.lobby_frame, padding=(0, 0, 0, 10))
         lobby_header.grid(row=0, column=0, columnspan=2, sticky="ew")
-        ttk.Label(lobby_header, text="Connected Server:").pack(side="left")
-        ttk.Label(lobby_header, textvariable=self.server_var).pack(side="left", padx=(5, 0))
+        self.create_room_button = ttk.Button(
+            lobby_header, text="Create Room", command=self._create_room
+        )
+        self.create_room_button.pack(side="left")
         self.lobby_disconnect_button = ttk.Button(
             lobby_header, text="Disconnect", command=self._disconnect
         )
@@ -240,28 +330,6 @@ class OmokApp:
             ),
         )
         self.room_canvas.bind("<Configure>", self._on_room_canvas_configure)
-
-        self.lobby_empty_label = ttk.Label(
-            self.lobby_frame,
-            text="현재 생성된 방이 없습니다. 새 방을 만들어 주세요.",
-            anchor="center",
-        )
-        self.lobby_empty_label.grid(row=2, column=0, columnspan=2, pady=(8, 0), sticky="ew")
-
-        controls = ttk.Frame(self.lobby_frame, padding=(0, 10, 0, 0))
-        controls.grid(row=3, column=0, columnspan=2, sticky="ew")
-        self.create_room_button = ttk.Button(
-            controls, text="Create Room", command=self._create_room
-        )
-        self.create_room_button.pack(side="left")
-        self.join_room_button = ttk.Button(
-            controls, text="Join Room", command=self._join_selected_room
-        )
-        self.join_room_button.pack(side="left", padx=7)
-        self.refresh_rooms_button = ttk.Button(
-            controls, text="Refresh", command=self._request_room_list
-        )
-        self.refresh_rooms_button.pack(side="left")
 
         self.create_room_modal_canvas = tk.Canvas(
             self.lobby_frame,
@@ -331,71 +399,74 @@ class OmokApp:
             "<Return>", lambda _event: self._submit_create_room()
         )
 
+        self.join_room_modal_canvas = tk.Canvas(
+            self.lobby_frame,
+            background="#6B6258",
+            highlightthickness=0,
+            takefocus=True,
+        )
+        self.join_room_modal_canvas.bind(
+            "<Configure>", lambda _event: self._draw_join_room_modal()
+        )
+        self.join_room_modal_cancel_button = ttk.Button(
+            self.join_room_modal_canvas,
+            text="Cancel",
+            command=self._close_join_room_modal,
+        )
+        self.join_room_modal_submit_button = ttk.Button(
+            self.join_room_modal_canvas,
+            text="Join",
+            command=self._submit_join_room,
+        )
+        for widget in (
+            self.join_room_modal_cancel_button,
+            self.join_room_modal_submit_button,
+        ):
+            widget.bind("<Escape>", lambda _event: self._close_join_room_modal())
+
     def _build_game_frame(self) -> None:
         self.game_frame = ttk.Frame(self.content_frame)
         self.game_frame.rowconfigure(1, weight=1)
         self.game_frame.columnconfigure(0, weight=1)
+        self.game_frame.columnconfigure(1, weight=0)
 
-        info = ttk.LabelFrame(self.game_frame, text="Game", padding=7)
-        info.grid(row=0, column=0, sticky="ew")
-        self.turn_timer_widget = TurnTimerWidget(info)
+        room_header = ttk.Frame(self.game_frame, padding=(0, 0, 0, 7))
+        room_header.grid(row=0, column=0, sticky="ew")
+        room_header.columnconfigure(2, weight=1)
+        self.turn_timer_widget = TurnTimerWidget(room_header)
         self.turn_timer_widget.grid(
-            row=0,
-            column=0,
-            rowspan=3,
-            padx=(0, 14),
-            sticky="nw",
+            row=0, column=0, padx=(0, 8), sticky="w"
         )
-        ttk.Label(info, text="Room:").grid(row=0, column=2)
-        ttk.Label(
-            info,
-            textvariable=self.room_var,
-            font=("TkDefaultFont", 11, "bold"),
-        ).grid(
-            row=0, column=3, columnspan=3, padx=(4, 0), pady=(0, 6), sticky="w"
+        self.current_turn_widget = CurrentTurnWidget(room_header)
+        self.current_turn_widget.grid(row=0, column=1, padx=(0, 14), sticky="w")
+
+        self.control_slot = ttk.Frame(room_header)
+        self.control_slot.grid(row=0, column=2, sticky="w")
+        self.in_game_controls = ttk.Frame(self.control_slot)
+        self.in_game_controls.grid(row=0, column=0, sticky="w")
+        self.undo_button = ttk.Button(
+            self.in_game_controls, text="무르기", command=self._request_undo
         )
-        ttk.Label(info, text="Game:").grid(row=0, column=9, sticky="e")
-        ttk.Label(info, textvariable=self.game_type_var, width=9).grid(
-            row=0, column=10, columnspan=2, padx=(4, 0), sticky="w"
+        self.undo_button.pack(side="left")
+        self.resign_button = ttk.Button(
+            self.in_game_controls, text="기권", command=self._request_resign
         )
-        ttk.Label(info, text="You:").grid(row=1, column=2)
-        self.you_stone_label = ttk.Label(info, image=self._stone_images[None])
-        self.you_stone_label.grid(row=1, column=3, padx=(4, 12), sticky="w")
-        ttk.Label(info, text="Turn:").grid(row=1, column=4)
-        self.turn_stone_label = ttk.Label(info, image=self._stone_images[None])
-        self.turn_stone_label.grid(row=1, column=5, padx=(4, 12), sticky="w")
-        ttk.Label(info, text="Status:").grid(row=1, column=6)
-        ttk.Label(info, textvariable=self.status_var, width=11).grid(
-            row=1, column=7, sticky="w"
+        self.resign_button.pack(side="left", padx=(7, 0))
+
+        self.out_game_controls = ttk.Frame(self.control_slot)
+        self.out_game_controls.grid(row=0, column=0, sticky="w")
+        self.mode_toggle_button = ttk.Button(
+            self.out_game_controls, text="Observer ↔ Player", command=self._toggle_role
         )
-        ttk.Label(info, textvariable=self.settings_var).grid(
-            row=1, column=8, padx=(10, 0), sticky="e"
+        self.mode_toggle_button.pack(side="left")
+        self.ready_button = ttk.Button(
+            self.out_game_controls, text="Ready", command=self._send_ready
         )
-        info.columnconfigure(8, weight=1)
-        ttk.Label(info, textvariable=self.role_var).grid(
-            row=2, column=2, columnspan=3, pady=(5, 0), sticky="w"
+        self.ready_button.pack(side="left", padx=(7, 0))
+        self.leave_room_button = ttk.Button(
+            self.out_game_controls, text="Leave Room", command=self._leave_room
         )
-        ttk.Label(info, textvariable=self.score_var).grid(
-            row=2, column=5, columnspan=4, pady=(5, 0), sticky="w"
-        )
-        self.undo_button = ttk.Button(info, text="Undo", command=self._request_undo)
-        self.undo_button.grid(row=1, column=9, padx=(10, 0))
-        self.ready_button = ttk.Button(info, text="Ready", command=self._send_ready)
-        self.ready_button.grid(row=1, column=10, padx=(7, 0))
-        self.become_player_button = ttk.Button(
-            info, text="Become Player", command=self._become_player
-        )
-        self.become_player_button.grid(row=2, column=9, columnspan=2, padx=(10, 0))
-        self.become_observer_button = ttk.Button(
-            info, text="Observe", command=self._become_observer
-        )
-        self.become_observer_button.grid(row=2, column=11, columnspan=2, padx=(7, 0))
-        self.leave_room_button = ttk.Button(info, text="Leave Room", command=self._leave_room)
-        self.leave_room_button.grid(row=1, column=11, padx=(7, 0))
-        self.game_disconnect_button = ttk.Button(
-            info, text="Disconnect", command=self._disconnect
-        )
-        self.game_disconnect_button.grid(row=1, column=12, padx=(7, 0))
+        self.leave_room_button.pack(side="left", padx=(7, 0))
 
         self.canvas = tk.Canvas(
             self.game_frame,
@@ -406,6 +477,10 @@ class OmokApp:
             highlightbackground="#7B542B",
         )
         self.canvas.grid(row=1, column=0, pady=(7, 0), sticky="nsew")
+        self.room_member_list = RoomMemberList(self.game_frame)
+        self.room_member_list.grid(
+            row=0, column=1, rowspan=2, padx=(7, 0), sticky="nsew"
+        )
         self.canvas.bind("<Button-1>", self._on_board_click)
         self.canvas.bind("<Motion>", self._on_mouse_move)
         self.canvas.bind("<Leave>", self._on_mouse_leave)
@@ -413,6 +488,8 @@ class OmokApp:
         self.board_overlay = CanvasOverlay(self.canvas)
         self.undo_action_overlay = ActionModalOverlay(self.canvas)
         self.undo_blocking_overlay = SystemBlockingOverlay(self.canvas)
+        self.resign_action_overlay = ActionModalOverlay(self.canvas)
+        self.resign_blocking_overlay = SystemBlockingOverlay(self.canvas)
         self.ready_blocking_overlay = SystemBlockingOverlay(self.canvas)
         self.turn_timer = TurnTimer(self.root, self._set_turn_time_display)
 
@@ -434,16 +511,27 @@ class OmokApp:
         )
 
     def _open_settings_modal(self) -> None:
-        if self.state.connected or self._connecting or self._settings_modal_open:
+        if (
+            self._connecting
+            or self._settings_modal_open
+            or self.state.view_state == IN_ROOM
+            or self._login_request_pending
+            or self._account_request_pending
+        ):
             return
         self._settings_modal_open = True
         self._settings_server_var.set(self.server_var.get())
+        self._settings_account_id_var.set(
+            self.state.account_id or self.login_account_id_var.get() or "Not saved"
+        )
+        self._settings_auto_login_var.set(self.auto_login_var.get())
         self._settings_error_var.set("")
         self.settings_modal_canvas.place(x=0, y=0, relwidth=1, relheight=1)
         self.settings_modal_canvas.tk.call("raise", self.settings_modal_canvas._w)
         self.root.update_idletasks()
         self._draw_settings_modal()
-        self.settings_server_entry.focus_set()
+        if not self.state.connected:
+            self.settings_server_entry.focus_set()
         self._render_controls()
 
     def _draw_settings_modal(self) -> None:
@@ -456,7 +544,7 @@ class OmokApp:
         center_x = width / 2
         center_y = height / 2
         panel_width = min(540, width - 50)
-        panel_height = 270
+        panel_height = 480
         left = center_x - panel_width / 2
         right = center_x + panel_width / 2
         top = center_y - panel_height / 2
@@ -475,29 +563,67 @@ class OmokApp:
         canvas.create_text(
             center_x,
             top + 44,
-            text="Connection Settings",
+            text="Settings",
             fill="#3E2B18",
             font=("TkDefaultFont", 18, "bold"),
         )
         canvas.create_text(
             left + 32,
-            top + 91,
-            text="Server URL",
+            top + 84,
+            text="Network Settings",
             anchor="w",
             fill="#3E2B18",
-            font=("TkDefaultFont", 10, "bold"),
+            font=("TkDefaultFont", 12, "bold"),
+        )
+        canvas.create_text(
+            left + 48, top + 116, text="Server URL", anchor="w",
+            fill="#3E2B18", font=("TkDefaultFont", 10, "bold"),
         )
         canvas.create_window(
             center_x,
-            top + 124,
+            top + 148,
             window=self.settings_server_entry,
-            width=panel_width - 64,
+            width=panel_width - 96,
+        )
+        canvas.create_line(
+            left + 32, top + 174, right - 32, top + 174, fill="#D6C3A5"
+        )
+        canvas.create_text(
+            left + 32, top + 196, text="Account Settings", anchor="w",
+            fill="#3E2B18", font=("TkDefaultFont", 12, "bold"),
+        )
+        canvas.create_text(
+            left + 48, top + 229, text="Account ID", anchor="w",
+            fill="#3E2B18", font=("TkDefaultFont", 10, "bold"),
+        )
+        canvas.create_text(
+            left + 150, top + 229, text=self._settings_account_id_var.get(),
+            anchor="w", fill="#3E2B18", font=("TkDefaultFont", 10),
+        )
+        canvas.create_window(
+            left + 150, top + 263, window=self.settings_auto_login_check,
+            anchor="w",
+        )
+        canvas.create_line(
+            left + 32, top + 289, right - 32, top + 289, fill="#D6C3A5"
+        )
+        canvas.create_text(
+            left + 32, top + 311, text="Application Information", anchor="w",
+            fill="#3E2B18", font=("TkDefaultFont", 12, "bold"),
         )
         canvas.create_window(
             center_x,
-            top + 160,
+            bottom - 76,
             window=self.settings_modal_error_label,
             width=panel_width - 64,
+        )
+        canvas.create_text(
+            left + 48,
+            top + 345,
+            text=f"Client Version    {CLIENT_VERSION}",
+            anchor="w",
+            fill="#76685A",
+            font=("TkDefaultFont", 10, "bold"),
         )
         canvas.create_window(
             center_x - 48,
@@ -514,16 +640,31 @@ class OmokApp:
         if not self._settings_modal_open:
             return
         try:
-            server_url = normalize_server_url(self._settings_server_var.get())
+            server_url = (
+                self.server_var.get()
+                if self.state.connected
+                else normalize_server_url(self._settings_server_var.get())
+            )
+            auto_login = self._settings_auto_login_var.get()
+            account_id = self.state.account_id or self.login_account_id_var.get()
+            if auto_login and (not account_id or not self.login_password_var.get()):
+                raise ValueError("Auto Login requires saved login information.")
             save_client_settings(
-                ClientSettings(server_url=server_url), self._settings_path
+                ClientSettings(
+                    server_url=server_url,
+                    account_id=account_id,
+                    password=self.login_password_var.get(),
+                    auto_login=auto_login,
+                ),
+                self._settings_path,
             )
         except (OSError, ValueError) as exc:
             self._settings_error_var.set(str(exc))
             return
         self.server_var.set(server_url)
+        self.auto_login_var.set(auto_login)
         self._close_settings_modal()
-        self.message_var.set("Connection settings saved.")
+        self.message_var.set("Settings saved.")
 
     def _close_settings_modal(self) -> None:
         if not self._settings_modal_open:
@@ -532,6 +673,10 @@ class OmokApp:
         self.settings_modal_canvas.place_forget()
         self.settings_modal_canvas.delete("all")
         self._settings_server_var.set(self.server_var.get())
+        self._settings_account_id_var.set(
+            self.state.account_id or self.login_account_id_var.get() or "Not saved"
+        )
+        self._settings_auto_login_var.set(self.auto_login_var.get())
         self._settings_error_var.set("")
         self._render_controls()
 
@@ -540,10 +685,9 @@ class OmokApp:
             return
         self.network.disconnect()
         self.lobby_disconnect_button.configure(state="disabled")
-        self.game_disconnect_button.configure(state="disabled")
         self.message_var.set("Disconnecting...")
 
-    def _connect(self) -> None:
+    def _connect_to_server(self) -> None:
         if self._settings_modal_open:
             return
         try:
@@ -571,6 +715,7 @@ class OmokApp:
             self.state.view_state != LOBBY
             or self._room_request_pending
             or self._create_room_modal_open
+            or self._join_room_modal_open
         ):
             return
         self._create_room_modal_open = True
@@ -753,28 +898,99 @@ class OmokApp:
         for radio in self.create_turn_time_radios:
             radio.configure(state=state)
 
-    def _join_selected_room(self) -> None:
-        room = self._selected_room()
+    def _open_join_room_modal(self, room_id: str) -> None:
+        room = next((item for item in self.state.rooms if item.room_id == room_id), None)
         if (
             self.state.view_state != LOBBY
             or self._room_request_pending
+            or self._create_room_modal_open
+            or self._join_room_modal_open
             or room is None
             or not room.can_join
         ):
             return
-        self._room_request_pending = True
-        self.network.join_room(room.room_id)
-        self.message_var.set(f"Joining '{room.room_name}'...")
+        self._join_room_modal_open = True
+        self._join_room_id = room.room_id
+        self._join_room_name = room.room_name
+        self.join_room_modal_canvas.place(x=0, y=0, relwidth=1, relheight=1)
+        self.join_room_modal_canvas.tk.call("raise", self.join_room_modal_canvas._w)
+        self.root.update_idletasks()
+        self._draw_join_room_modal()
+        self.join_room_modal_submit_button.focus_set()
         self._render_controls()
+
+    def _draw_join_room_modal(self) -> None:
+        if not self._join_room_modal_open:
+            return
+        canvas = self.join_room_modal_canvas
+        canvas.delete("all")
+        width = max(canvas.winfo_width(), 500)
+        height = max(canvas.winfo_height(), 360)
+        center_x = width / 2
+        center_y = height / 2
+        panel_width = min(460, width - 50)
+        panel_height = 230
+        left = center_x - panel_width / 2
+        right = center_x + panel_width / 2
+        top = center_y - panel_height / 2
+        bottom = center_y + panel_height / 2
+        canvas.create_rectangle(0, 0, width, height, fill="#6B6258", outline="")
+        canvas.create_rectangle(
+            left, top, right, bottom, fill="#FFF8EA",
+            outline="#7B542B", width=3,
+        )
+        canvas.create_text(
+            center_x, top + 44, text="Join Room", fill="#3E2B18",
+            font=("TkDefaultFont", 18, "bold"),
+        )
+        canvas.create_text(
+            center_x, top + 94, text=f"'{self._join_room_name}'",
+            fill="#3E2B18", font=("TkDefaultFont", 11, "bold"),
+        )
+        canvas.create_text(
+            center_x, top + 124, text="이 방에 입장하시겠습니까?",
+            fill="#3E2B18", font=("TkDefaultFont", 10),
+        )
+        canvas.create_window(
+            center_x - 48, bottom - 42,
+            window=self.join_room_modal_cancel_button,
+        )
+        canvas.create_window(
+            center_x + 48, bottom - 42,
+            window=self.join_room_modal_submit_button,
+        )
+
+    def _submit_join_room(self) -> None:
+        if (
+            not self._join_room_modal_open
+            or self._room_request_pending
+            or self._join_room_id is None
+        ):
+            return
+        self._room_request_pending = True
+        self.network.join_room(self._join_room_id)
+        self.message_var.set(f"Joining '{self._join_room_name}'...")
+        self._render_controls()
+
+    def _close_join_room_modal(self) -> None:
+        if not self._join_room_modal_open or self._room_request_pending:
+            return
+        self._join_room_modal_open = False
+        self._join_room_id = None
+        self._join_room_name = ""
+        self.join_room_modal_canvas.place_forget()
+        self.join_room_modal_canvas.delete("all")
+        self._render_controls()
+
+    def _reset_join_room_modal(self) -> None:
+        self._room_request_pending = False
+        self._close_join_room_modal()
 
     def _leave_room(self) -> None:
         if (
             self.state.view_state != IN_ROOM
             or self._leave_pending
-            or (
-                self.state.my_role == PLAYER
-                and self.state.game_status == "PLAYING"
-            )
+            or self.state.game_status == "PLAYING"
         ):
             return
         self._leave_pending = True
@@ -826,6 +1042,12 @@ class OmokApp:
         self.message_var.set("Requesting Observer role...")
         self._render_controls()
 
+    def _toggle_role(self) -> None:
+        if self.state.my_role == OBSERVER:
+            self._become_player()
+        elif self.state.my_role == PLAYER:
+            self._become_observer()
+
     def _request_undo(self) -> None:
         if (
             self.state.view_state != IN_ROOM
@@ -854,28 +1076,54 @@ class OmokApp:
         self.network.respond_undo(accepted)
         self.message_var.set("Undo response sent. Waiting for server...")
 
-    def _selected_room(self) -> RoomSummary | None:
-        return next(
-            (room for room in self.state.rooms if room.room_id == self._selected_room_id),
-            None,
+    def _request_resign(self) -> None:
+        if (
+            self.state.view_state != IN_ROOM
+            or self.state.my_role != PLAYER
+            or self.state.game_status != "PLAYING"
+            or self._undo_pending
+            or self._resign_pending
+        ):
+            return
+        self._clear_hover()
+        self.resign_action_overlay.show_actions(
+            "기권",
+            "정말 기권하시겠습니까?",
+            (
+                OverlayAction("기권", self._confirm_resign),
+                OverlayAction("취소", self._cancel_resign),
+            ),
+            kind="warning",
+            content_tag="resign_confirm_overlay",
         )
 
-    def _select_room(self, room_id: str) -> None:
-        if room_id not in self.room_cards:
+    def _confirm_resign(self) -> None:
+        if self._resign_pending or not self.resign_action_overlay.visible:
             return
-        self._selected_room_id = room_id
-        self._render_room_card_selection()
+        self.resign_action_overlay.clear()
+        self._resign_pending = True
+        self.resign_blocking_overlay.show_blocking(
+            "기권",
+            "서버의 게임 종료 처리를 기다리는 중입니다.",
+        )
+        self.network.resign()
+        self.message_var.set("Resignation sent. Waiting for server...")
         self._render_controls()
 
-    def _on_room_double_click(self, room_id: str) -> None:
-        self._select_room(room_id)
-        self._join_selected_room()
+    def _cancel_resign(self) -> None:
+        if self._resign_pending:
+            return
+        self.resign_action_overlay.clear()
 
     def _on_room_canvas_configure(self, event: tk.Event[tk.Misc]) -> None:
         self.room_canvas.itemconfigure(self._room_grid_window, width=event.width)
         self._layout_room_cards(event.width)
 
     def _on_board_click(self, event: tk.Event[tk.Misc]) -> None:
+        if self.resign_action_overlay.consume_click():
+            return
+        if self.resign_blocking_overlay.consume_click():
+            return
         if self.undo_action_overlay.consume_click():
             return
         if self.ready_blocking_overlay.consume_click():
@@ -913,6 +1161,8 @@ class OmokApp:
     def _on_mouse_move(self, event: tk.Event[tk.Misc]) -> None:
         if (
             self.undo_action_overlay.visible
+            or self.resign_action_overlay.visible
+            or self.resign_blocking_overlay.visible
             or self.ready_blocking_overlay.visible
             or self.undo_blocking_overlay.visible
             or self.board_overlay.visible
@@ -946,12 +1196,17 @@ class OmokApp:
             self._preview_item_id = None
 
     def _clear_pending_requests(self) -> None:
+        self._account_request_pending = False
+        self._login_request_pending = False
+        self._pending_account_id = None
+        self._pending_account_password = None
         self._room_request_pending = False
         self._leave_pending = False
         self._role_change_pending = False
         self._move_pending = False
         self._clear_ready_state()
         self._clear_undo_state()
+        self._clear_resign_state()
         self._cancel_forbidden_flash()
 
     def _clear_ready_state(self) -> None:
@@ -963,6 +1218,11 @@ class OmokApp:
         self._undo_waiting_for_game_state = False
         self.undo_action_overlay.clear()
         self.undo_blocking_overlay.clear_from_system()
+
+    def _clear_resign_state(self) -> None:
+        self._resign_pending = False
+        self.resign_action_overlay.clear()
+        self.resign_blocking_overlay.clear_from_system()
 
     def _show_forbidden_popup(self, message: str) -> None:
         self._clear_hover()
@@ -1022,6 +1282,7 @@ class OmokApp:
         self.board_overlay.clear()
         self._clear_ready_state()
         self._clear_undo_state()
+        self._clear_resign_state()
         self._result_popup_dismissed = False
 
     def _sync_forbidden_flash(self) -> None:
@@ -1068,8 +1329,6 @@ class OmokApp:
 
     def _handle_network_event(self, event: NetworkEvent) -> None:
         if event.kind == "connected":
-            self._connecting = False
-            self.state.connected = True
             self.message_var.set("Connected. Waiting for lobby confirmation...")
         elif event.kind == "disconnected":
             self._connecting = False
@@ -1078,6 +1337,7 @@ class OmokApp:
             self._reset_board_popup()
             self._clear_pending_requests()
             self.turn_timer.deactivate()
+            self.room_member_list.set_members((), ())
             if not self._closing and not self.message_var.get().startswith("Connection lost"):
                 self.message_var.set(event.message)
         elif event.kind in {"network_error", "protocol_error"}:
@@ -1120,15 +1380,56 @@ class OmokApp:
         is_forbidden_error = (
             message_type == "error" and payload.get("code") == "FORBIDDEN_MOVE"
         )
-        if is_forbidden_error:
+        if message_type == "room_list":
+            pass
+        elif is_forbidden_error:
             self.message_var.set(self.state.turn_message())
         else:
             self.message_var.set(change.message)
         if message_type == "connected":
+            self._connecting = False
+            self._authentication_view = "login"
+            self.message_var.set("Connected. Log in to continue.")
+            if (
+                self.auto_login_var.get()
+                and self.login_account_id_var.get()
+                and self.login_password_var.get()
+            ):
+                self._login_view_submit()
+        elif message_type == "account_created":
+            account_id = self._pending_account_id or str(payload.get("account_id", ""))
+            password = self._pending_account_password or ""
+            self.login_account_id_var.set(account_id)
+            self.login_password_var.set(password)
+            self._account_request_pending = False
+            self._pending_account_id = None
+            self._pending_account_password = None
+            self.create_account_id_var.set("")
+            self.create_account_password_var.set("")
+            self.create_account_password_confirm_var.set("")
+            self.create_account_nickname_var.set("")
+            self._authentication_view = "login"
+            self.message_var.set("Account created. Log in with the new account.")
+        elif message_type == "login_succeeded":
+            self._login_request_pending = False
+            try:
+                save_client_settings(
+                    ClientSettings(
+                        server_url=self.server_var.get(),
+                        account_id=self.login_account_id_var.get(),
+                        password=self.login_password_var.get(),
+                        auto_login=self.auto_login_var.get(),
+                    ),
+                    self._settings_path,
+                )
+            except (OSError, ValueError) as exc:
+                LOGGER.warning("Could not save login settings: %s", exc)
+                self.message_var.set(f"Logged in, but settings were not saved: {exc}")
             self.network.request_room_list()
         elif message_type == "room_list":
             self._render_room_list()
         elif message_type == "joined":
+            self._reset_join_room_modal()
             self._reset_board_popup()
             self._room_request_pending = False
             self._leave_pending = False
@@ -1136,6 +1437,7 @@ class OmokApp:
             self._role_change_pending = False
             self._move_pending = False
             self.turn_timer.deactivate()
+            self.room_member_list.set_members((), ())
         elif message_type == "left_room":
             self._reset_board_popup()
             self._leave_pending = False
@@ -1143,9 +1445,11 @@ class OmokApp:
             self._role_change_pending = False
             self._move_pending = False
             self.turn_timer.deactivate()
+            self.room_member_list.set_members((), ())
             self.network.request_room_list()
         elif message_type == "error":
             self._clear_pending_requests()
+            self._reset_join_room_modal()
             self._sync_forbidden_flash()
             if is_forbidden_error:
                 self._show_forbidden_popup(change.message)
@@ -1160,6 +1464,9 @@ class OmokApp:
             self._clear_ready_state()
             self.board_overlay.clear()
         elif message_type == "room_members":
+            self.room_member_list.set_members(
+                self.state.player_members, self.state.observer_members
+            )
             if not self.state.my_ready:
                 self.ready_blocking_overlay.clear_from_system()
         elif message_type == "ready_confirmed":
@@ -1188,6 +1495,7 @@ class OmokApp:
             if message_type == "game_state":
                 self._sync_turn_timer_from_state()
             elif message_type == "game_over":
+                self._clear_resign_state()
                 self.turn_timer.deactivate()
         elif message_type == "turn_timeout":
             self._move_pending = False
@@ -1242,7 +1550,13 @@ class OmokApp:
             LOGGER.warning(change.message)
 
     def _render_view(self) -> None:
-        for frame in (self.connection_frame, self.lobby_frame, self.game_frame):
+        for frame in (
+            self.connection_frame,
+            self.login_frame,
+            self.create_account_frame,
+            self.lobby_frame,
+            self.game_frame,
+        ):
             frame.grid_remove()
         if self.state.view_state != IN_ROOM:
             self._draw_board()
@@ -1253,16 +1567,27 @@ class OmokApp:
             self.game_frame.grid(row=0, column=0, sticky="nsew")
             self._draw_board()
         else:
-            self.connection_frame.grid(row=0, column=0, sticky="nsew")
+            if not self.state.connected or self._authentication_view == "connection":
+                authentication_frame = self.connection_frame
+            elif self._authentication_view == "create_account":
+                authentication_frame = self.create_account_frame
+            else:
+                authentication_frame = self.login_frame
+            authentication_frame.grid(row=0, column=0, sticky="nsew")
         if self.state.view_state != LOBBY:
             self._close_create_room_modal()
-        if self.state.view_state != DISCONNECTED:
+            self._reset_join_room_modal()
+        if self.state.view_state == IN_ROOM:
             self._close_settings_modal()
         self._render_controls()
 
     def _render_room_list(self) -> None:
-        if self._selected_room_id not in {room.room_id for room in self.state.rooms}:
-            self._selected_room_id = None
+        if (
+            self._join_room_modal_open
+            and self._join_room_id not in {room.room_id for room in self.state.rooms}
+            and not self._room_request_pending
+        ):
+            self._reset_join_room_modal()
         for card in self.room_cards.values():
             card.destroy()
         self.room_cards.clear()
@@ -1280,7 +1605,7 @@ class OmokApp:
                 ),
                 image=self._stone_images[BLACK],
                 compound="top",
-                command=lambda room_id=room.room_id: self._select_room(room_id),
+                command=lambda room_id=room.room_id: self._open_join_room_modal(room_id),
                 background="#FFF8EA",
                 activebackground="#F7DDAF",
                 foreground="#3E2B18",
@@ -1291,17 +1616,8 @@ class OmokApp:
                 pady=12,
                 cursor="hand2",
             )
-            card.bind(
-                "<Double-1>",
-                lambda _event, room_id=room.room_id: self._on_room_double_click(room_id),
-            )
             self.room_cards[room.room_id] = card
         self._layout_room_cards(self.room_canvas.winfo_width())
-        self._render_room_card_selection()
-        if self.state.rooms:
-            self.lobby_empty_label.grid_remove()
-        else:
-            self.lobby_empty_label.grid()
         self._render_controls()
 
     @staticmethod
@@ -1328,92 +1644,102 @@ class OmokApp:
                 sticky="nsew",
             )
 
-    def _render_room_card_selection(self) -> None:
-        for room_id, card in self.room_cards.items():
-            selected = room_id == self._selected_room_id
-            card.configure(
-                background="#F4C873" if selected else "#FFF8EA",
-                relief="sunken" if selected else "raised",
-                borderwidth=3 if selected else 2,
-                state="disabled" if self._create_room_modal_open else "normal",
-            )
-
     def _render_status(self) -> None:
-        self.room_var.set(self.state.room_name or self.state.room_id or "-")
-        self.game_type_var.set(self.state.game_type.label if self.state.game_type else "-")
-        self.you_var.set(self.state.my_color or "-")
-        role = self.state.my_role or "-"
-        color = f" / {self.state.my_color.title()}" if self.state.my_color else ""
-        self.role_var.set(
-            f"Role: {role.title()}{color} · "
-            f"Players {self.state.player_count}/2 · Observers {self.state.observer_count}"
-        )
-        self.turn_var.set(self.state.current_turn or "-")
-        self.you_stone_label.configure(
-            image=self._stone_images.get(self.state.my_color, self._stone_images[None])
-        )
-        self.turn_stone_label.configure(
-            image=self._stone_images.get(self.state.current_turn, self._stone_images[None])
-        )
-        self.status_var.set(self.state.game_status.replace("_", " ").title())
-        if self.state.game_type is GameType.OTHELLO:
-            self.settings_var.set(f"Board: {self.state.board_size} x {self.state.board_size}")
-            self.score_var.set(
-                f"Score: Black {self.state.score[BLACK]} · White {self.state.score[WHITE]}"
-            )
-        else:
-            self.settings_var.set(
-                f"Board: {self.state.board_size} x {self.state.board_size} / "
-                f"Win: {self.state.win_length}"
-            )
-            self.score_var.set("")
+        self.current_turn_widget.set_color(self.state.current_turn)
         self._render_controls()
 
     def _render_controls(self) -> None:
-        connection_available = (
-            not self.state.connected
-            and not self._connecting
+        authentication_available = (
+            self.state.connected
+            and self.state.view_state == DISCONNECTED
+            and not self._account_request_pending
+            and not self._login_request_pending
             and not self._settings_modal_open
         )
         self.connect_button.configure(
-            text="Connect",
-            state="normal" if connection_available else "disabled",
+            text="Login",
+            state="normal" if authentication_available else "disabled",
         )
         self.settings_button.configure(
-            state="normal" if connection_available else "disabled"
+            state="normal"
+            if not self.state.connected and not self._connecting
+            else "disabled"
+        )
+        self.login_frame.settings_button.configure(
+            state="normal" if authentication_available else "disabled"
         )
         in_lobby = self.state.connected and self.state.view_state == LOBBY
-        lobby_available = in_lobby and not self._create_room_modal_open
+        lobby_available = (
+            in_lobby
+            and self.state.authenticated
+            and self.state.account_id is not None
+            and self.state.account_nickname is not None
+            and not self._create_room_modal_open
+            and not self._join_room_modal_open
+        )
+        self.connection_frame.retry_button.configure(
+            state="normal"
+            if not self.state.connected and not self._connecting
+            else "disabled"
+        )
+        self.login_frame.account_id_entry.configure(
+            state="normal" if authentication_available else "disabled"
+        )
+        self.login_frame.password_entry.configure(
+            state="normal" if authentication_available else "disabled"
+        )
+        self.login_frame.auto_login_check.configure(
+            state="normal" if authentication_available else "disabled"
+        )
+        self.login_frame.create_account_button.configure(
+            state="normal" if authentication_available else "disabled"
+        )
+        for entry in self.create_account_frame.entries:
+            entry.configure(
+                state="normal" if authentication_available else "disabled"
+            )
+        self.create_account_frame.back_button.configure(
+            state="normal" if authentication_available else "disabled"
+        )
+        self.create_account_frame.create_button.configure(
+            state="normal" if authentication_available else "disabled"
+        )
         self.create_room_button.configure(
             state="normal"
             if lobby_available and not self._room_request_pending
             else "disabled"
         )
-        room = self._selected_room()
-        can_join = (
-            lobby_available
-            and not self._room_request_pending
-            and room is not None
-            and room.can_join
-        )
-        self.join_room_button.configure(state="normal" if can_join else "disabled")
-        self.refresh_rooms_button.configure(state="normal" if lobby_available else "disabled")
         disconnect_state = "normal" if self.state.connected else "disabled"
         self.lobby_disconnect_button.configure(
-            state=disconnect_state if not self._create_room_modal_open else "disabled"
+            state=disconnect_state
+            if not self._create_room_modal_open and not self._join_room_modal_open
+            else "disabled"
         )
-        self.game_disconnect_button.configure(state=disconnect_state)
+        self.settings_server_entry.configure(
+            state="disabled" if self.state.connected else "normal"
+        )
+        self.settings_auto_login_check.configure(
+            state="normal" if self._settings_modal_open else "disabled"
+        )
         for card in self.room_cards.values():
-            card.configure(state="disabled" if self._create_room_modal_open else "normal")
+            card.configure(
+                state="disabled"
+                if self._create_room_modal_open or self._join_room_modal_open
+                else "normal"
+            )
+        join_action_state = (
+            "normal"
+            if self._join_room_modal_open and not self._room_request_pending
+            else "disabled"
+        )
+        self.join_room_modal_cancel_button.configure(state=join_action_state)
+        self.join_room_modal_submit_button.configure(state=join_action_state)
         self.leave_room_button.configure(
             state="normal"
             if (
                 self.state.view_state == IN_ROOM
                 and not self._leave_pending
-                and not (
-                    self.state.my_role == PLAYER
-                    and self.state.game_status == "PLAYING"
-                )
+                and self.state.game_status in {"WAITING", "FINISHED"}
             )
             else "disabled"
         )
@@ -1436,9 +1762,6 @@ class OmokApp:
             and self.state.player_count < 2
             and not self._role_change_pending
         )
-        self.become_player_button.configure(
-            state="normal" if can_become_player else "disabled"
-        )
         can_become_observer = (
             self.state.view_state == IN_ROOM
             and self.state.connected
@@ -1446,8 +1769,17 @@ class OmokApp:
             and self.state.game_status != "PLAYING"
             and not self._role_change_pending
         )
-        self.become_observer_button.configure(
-            state="normal" if can_become_observer else "disabled"
+        can_toggle_role = can_become_player or can_become_observer
+        toggle_text = (
+            "Observer → Player"
+            if self.state.my_role == OBSERVER
+            else "Player → Observer"
+            if self.state.my_role == PLAYER
+            else "Observer ↔ Player"
+        )
+        self.mode_toggle_button.configure(
+            text=toggle_text,
+            state="normal" if can_toggle_role else "disabled",
         )
         can_undo = (
             self.state.view_state == IN_ROOM
@@ -1459,6 +1791,21 @@ class OmokApp:
             and not self._undo_pending
         )
         self.undo_button.configure(state="normal" if can_undo else "disabled")
+        can_resign = (
+            self.state.view_state == IN_ROOM
+            and self.state.connected
+            and self.state.my_role == PLAYER
+            and self.state.game_status == "PLAYING"
+            and not self._undo_pending
+            and not self._resign_pending
+        )
+        self.resign_button.configure(state="normal" if can_resign else "disabled")
+        if self.state.game_status == "PLAYING":
+            self.out_game_controls.grid_remove()
+            self.in_game_controls.grid()
+        else:
+            self.in_game_controls.grid_remove()
+            self.out_game_controls.grid()
 
     def _geometry(self) -> BoardGeometry | OthelloBoardGeometry:
         width = self.canvas.winfo_width()
@@ -1694,6 +2041,8 @@ class OmokApp:
         self.ready_blocking_overlay.redraw()
         self.undo_blocking_overlay.redraw()
         self.undo_action_overlay.redraw()
+        self.resign_blocking_overlay.redraw()
+        self.resign_action_overlay.redraw()
 
     def _on_close(self) -> None:
         if self._closing:
@@ -1709,6 +2058,7 @@ class OmokApp:
         self.board_overlay.clear()
         self._clear_ready_state()
         self._clear_undo_state()
+        self._clear_resign_state()
         self.turn_timer.close()
         self.network.shutdown()
         self.root.destroy()

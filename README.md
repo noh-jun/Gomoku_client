@@ -2,6 +2,8 @@
 
 Tkinter GUI와 `asyncio` WebSocket 통신을 분리한 온라인 오목·오셀로 클라이언트입니다. 서버가 게임의 authoritative state와 보드 설정을 가지며, 클라이언트는 서버에서 받은 `game_type`, `board`, `move_result`, `game_state`, `restart`를 검증한 뒤 화면에 반영합니다.
 
+클라이언트 릴리스 버전은 `omok_client/version.py`의 `CLIENT_VERSION`에서 관리하며 Connection Settings 화면에 표시됩니다. 서버 버전 및 WebSocket 프로토콜 버전과는 별개의 값입니다.
+
 ## 구조
 
 ```text

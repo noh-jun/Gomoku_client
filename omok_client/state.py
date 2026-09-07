@@ -4,7 +4,9 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from .game_type import GameType
+from .account import normalize_account_id
 from .room_name import normalize_room_name
+from .nickname import normalize_nickname
 
 DEFAULT_BOARD_SIZE = 15
 DEFAULT_WIN_LENGTH = 5
@@ -45,6 +47,13 @@ class StateChange:
     handled: bool
     message: str
     redraw_board: bool = False
+
+
+@dataclass(frozen=True)
+class RoomMember:
+    nickname: str
+    color: str | None = None
+    ready: bool = False
 
 
 @dataclass(frozen=True)
@@ -102,6 +111,11 @@ class AppState:
     turn_time_limit_sec: int | None = None
     turn_deadline_unix_ms: int | None = None
     turn_revision: int = 0
+    account_nickname: str | None = None
+    account_id: str | None = None
+    authenticated: bool = False
+    player_members: list[RoomMember] = field(default_factory=list)
+    observer_members: list[RoomMember] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         effective_type = self.game_type or GameType.GOMOKU
@@ -159,12 +173,17 @@ class AppState:
         self.score = new_score()
         self.passed_color = None
         self.ready_colors.clear()
+        self.player_members.clear()
+        self.observer_members.clear()
         self.turn_time_limit_sec = None
         self.turn_deadline_unix_ms = None
         self.turn_revision = 0
 
     def reset_connection(self) -> None:
         self.connected = False
+        self.account_nickname = None
+        self.account_id = None
+        self.authenticated = False
         self.rooms = []
         self.supported_game_types = {GameType.GOMOKU}
         self.reset_room_state()
@@ -222,13 +241,31 @@ class AppState:
             supported = _validated_supported_game_types(data.get("supported_game_types"))
             self.connected = True
             self.supported_game_types = supported
-            self.reset_room_state()
-            return StateChange(True, "Lobby connected.")
+            self.view_state = DISCONNECTED
+            self.game_status = DISCONNECTED
+            return StateChange(True, "Connected. Log in to continue.")
+
+        if message_type == "account_created":
+            account_id = data.get("account_id")
+            if not isinstance(account_id, str) or not account_id:
+                raise ValueError("account_created.account_id must be a non-empty string")
+            nickname = normalize_nickname(data.get("nickname"))
+            return StateChange(True, f"Account created: {account_id} ({nickname})")
+
+        if message_type == "login_succeeded":
+            account_id = normalize_account_id(data.get("account_id"))
+            nickname = normalize_nickname(data.get("nickname"))
+            self.account_id = account_id
+            self.account_nickname = nickname
+            self.authenticated = True
+            self.view_state = LOBBY
+            self.game_status = LOBBY
+            return StateChange(True, "")
 
         if message_type == "room_list":
             rooms = _validated_rooms(data.get("rooms"))
             self.rooms = rooms
-            return StateChange(True, f"Room list updated ({len(rooms)}).")
+            return StateChange(True, "")
 
         if message_type == "room_created":
             room_id = _required_room_id(data, "room_created")
@@ -315,9 +352,17 @@ class AppState:
                 raise ValueError("room_members.ready_colors must contain valid colors")
             if len(set(ready)) != len(ready) or len(ready) > player_count:
                 raise ValueError("room_members.ready_colors is invalid")
+            player_members = _validated_player_members(
+                data.get("player_list"), player_count, set(ready)
+            )
+            observer_members = _validated_observer_members(
+                data.get("observer_list"), observer_count
+            )
             self.player_count = player_count
             self.observer_count = observer_count
             self.ready_colors = set(ready)
+            self.player_members = player_members
+            self.observer_members = observer_members
             return StateChange(True, f"Room members updated ({member_count}/99).")
 
         if message_type == "ready_confirmed":
@@ -646,6 +691,31 @@ class AppState:
                     "INVALID_TURN_TIME_LIMIT": "지원하지 않는 착수 제한 시간입니다.",
                     "UNSUPPORTED_GAME_OPTION": "현재 게임에서는 해당 방 설정을 지원하지 않습니다.",
                     "TURN_EXPIRED": "착수 제한 시간이 지나 해당 수가 반영되지 않았습니다.",
+                    "AUTHENTICATION_REQUIRED": "로그인 후 방에 입장할 수 있습니다.",
+                    "RESIGN_NOT_AVAILABLE": "현재는 기권할 수 없습니다.",
+                    "ACCOUNT_ID_MISSING": "Account ID를 입력해 주세요.",
+                    "ACCOUNT_ID_NOT_STRING": "Account ID 형식이 올바르지 않습니다.",
+                    "ACCOUNT_ID_EMPTY": "Account ID를 입력해 주세요.",
+                    "ACCOUNT_ID_TOO_SHORT": "Account ID는 4자 이상이어야 합니다.",
+                    "ACCOUNT_ID_TOO_LONG": "Account ID는 20자 이하여야 합니다.",
+                    "ACCOUNT_ID_INVALID_CHARACTER": "Account ID에는 영문만 사용할 수 있습니다.",
+                    "ACCOUNT_ID_TAKEN": "이미 사용 중인 Account ID입니다.",
+                    "PASSWORD_MISSING": "Password를 입력해 주세요.",
+                    "PASSWORD_NOT_STRING": "Password 형식이 올바르지 않습니다.",
+                    "PASSWORD_TOO_SHORT": "Password는 4자 이상이어야 합니다.",
+                    "PASSWORD_TOO_LONG": "Password는 20자 이하여야 합니다.",
+                    "PASSWORD_WHITESPACE_NOT_ALLOWED": "Password에는 공백을 사용할 수 없습니다.",
+                    "NICKNAME_MISSING": "Nickname을 입력해 주세요.",
+                    "NICKNAME_NOT_STRING": "Nickname 형식이 올바르지 않습니다.",
+                    "NICKNAME_EMPTY": "Nickname을 입력해 주세요.",
+                    "NICKNAME_TOO_LONG": "Nickname은 20자 이하여야 합니다.",
+                    "NICKNAME_INVALID_CHARACTER": "Nickname에 사용할 수 없는 문자가 있습니다.",
+                    "ACCOUNT_OPERATION_NOT_AVAILABLE": "현재는 계정 요청을 처리할 수 없습니다.",
+                    "ACCOUNT_REQUEST_PENDING": "다른 계정 요청을 처리하고 있습니다.",
+                    "ACCOUNT_CREATE_FAILED": "계정을 생성하지 못했습니다.",
+                    "INVALID_CREDENTIALS": "Account ID 또는 Password가 올바르지 않습니다.",
+                    "ALREADY_AUTHENTICATED": "이미 로그인되어 있습니다.",
+                    "LOGIN_FAILED": "로그인을 완료하지 못했습니다.",
                 }
                 detail = localized.get(code, f"{detail} [{code}]")
             return StateChange(True, detail)
@@ -668,6 +738,16 @@ class AppState:
         return "Your turn." if self.current_turn == self.my_color else "Opponent's turn."
 
     def build_game_over_message(self) -> str:
+        if self.game_over_reason == "resignation":
+            if self.my_role == OBSERVER:
+                loser = self.loser.title() if self.loser else "Player"
+                winner = self.winner.title() if self.winner else "Opponent"
+                return f"{loser} 기권\n{winner} 승리"
+            if self.loser == self.my_color:
+                return "기권하여 패배했습니다."
+            if self.winner == self.my_color:
+                return "상대가 기권하여 승리했습니다."
+            return "기권으로 게임이 종료되었습니다."
         if self.my_role == OBSERVER:
             if self.winner in VALID_COLORS:
                 return f"{self.winner.title()} 승리"
@@ -827,6 +907,41 @@ def _required_count(data: dict[str, Any], field_name: str, maximum: int) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= maximum:
         raise ValueError(f"{field_name} must be an integer from 0 to {maximum}")
     return value
+
+
+def _validated_player_members(
+    value: Any, expected_count: int, ready_colors: set[str]
+) -> list[RoomMember]:
+    if not isinstance(value, list) or len(value) != expected_count:
+        raise ValueError("room_members.player_list count is invalid")
+    members: list[RoomMember] = []
+    seen_colors: set[str] = set()
+    for item in value:
+        if not isinstance(item, dict):
+            raise ValueError("room_members.player_list entries must be objects")
+        nickname = normalize_nickname(item.get("nickname"))
+        color = _required_color(item, "color")
+        ready = item.get("ready")
+        if not isinstance(ready, bool):
+            raise ValueError("room_members.player_list.ready must be a boolean")
+        if color in seen_colors or ready != (color in ready_colors):
+            raise ValueError("room_members.player_list state is inconsistent")
+        seen_colors.add(color)
+        members.append(RoomMember(nickname, color, ready))
+    return members
+
+
+def _validated_observer_members(
+    value: Any, expected_count: int
+) -> list[RoomMember]:
+    if not isinstance(value, list) or len(value) != expected_count:
+        raise ValueError("room_members.observer_list count is invalid")
+    members: list[RoomMember] = []
+    for item in value:
+        if not isinstance(item, dict):
+            raise ValueError("room_members.observer_list entries must be objects")
+        members.append(RoomMember(normalize_nickname(item.get("nickname"))))
+    return members
 
 
 def _required_color(data: dict[str, Any], field_name: str) -> str:

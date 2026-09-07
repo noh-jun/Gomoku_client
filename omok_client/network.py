@@ -60,6 +60,21 @@ class NetworkClient:
     def request_room_list(self) -> None:
         self._submit_send(encode_message("get_room_list"))
 
+    def create_account(self, account_id: str, password: str, nickname: str) -> None:
+        self._submit_send(
+            encode_message(
+                "create_account",
+                account_id=account_id,
+                password=password,
+                nickname=nickname,
+            )
+        )
+
+    def login(self, account_id: str, password: str) -> None:
+        self._submit_send(
+            encode_message("login", account_id=account_id, password=password)
+        )
+
     def create_room(
         self,
         room_name: str,
@@ -96,6 +111,9 @@ class NetworkClient:
 
     def respond_undo(self, accepted: bool) -> None:
         self._submit_send(encode_message("undo_response", accepted=accepted))
+
+    def resign(self) -> None:
+        self._submit_send(encode_message("resign"))
 
     def ping(self) -> None:
         self._submit_send(encode_message("ping"))
@@ -159,7 +177,7 @@ class NetworkClient:
             return
         try:
             await websocket.send(raw)
-            LOGGER.info("Sent %s", raw)
+            LOGGER.info("Sent WebSocket message")
         except Exception as exc:
             LOGGER.warning("Send failed: %s", exc)
             self.events.put(NetworkEvent("network_error", message=f"Send failed: {exc}"))

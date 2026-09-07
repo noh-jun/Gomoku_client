@@ -14,7 +14,13 @@ htmlcov/
 
 # Application build output
 build/
-dist/
+dist/*
+!dist/windows/
+dist/windows/*
+!dist/windows/*.exe
+!dist/macos/
+dist/macos/*
+!dist/macos/*.dmg
 
 # IDE and OS metadata
 .idea/
