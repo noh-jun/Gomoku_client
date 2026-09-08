@@ -454,6 +454,10 @@ class OmokApp:
             self.in_game_controls, text="기권", command=self._request_resign
         )
         self.resign_button.pack(side="left", padx=(7, 0))
+        self.observer_leave_button = ttk.Button(
+            self.in_game_controls, text="나가기", command=self._leave_room
+        )
+        self.observer_leave_button.pack(side="left", padx=(7, 0))
 
         self.out_game_controls = ttk.Frame(self.control_slot)
         self.out_game_controls.grid(row=0, column=0, sticky="w")
@@ -997,7 +1001,10 @@ class OmokApp:
         if (
             self.state.view_state != IN_ROOM
             or self._leave_pending
-            or self.state.game_status == "PLAYING"
+            or (
+                self.state.game_status == "PLAYING"
+                and self.state.my_role != OBSERVER
+            )
         ):
             return
         self._leave_pending = True
@@ -1773,6 +1780,16 @@ class OmokApp:
             )
             else "disabled"
         )
+        can_observer_leave = (
+            self.state.view_state == IN_ROOM
+            and self.state.connected
+            and self.state.game_status == "PLAYING"
+            and self.state.my_role == OBSERVER
+            and not self._leave_pending
+        )
+        self.observer_leave_button.configure(
+            state="normal" if can_observer_leave else "disabled"
+        )
         can_ready = (
             self.state.view_state == IN_ROOM
             and self.state.connected
@@ -1836,6 +1853,14 @@ class OmokApp:
         if self.state.game_status == "PLAYING":
             self.out_game_controls.grid_remove()
             self.in_game_controls.grid()
+            self.undo_button.pack_forget()
+            self.resign_button.pack_forget()
+            self.observer_leave_button.pack_forget()
+            if self.state.my_role == PLAYER:
+                self.undo_button.pack(side="left")
+                self.resign_button.pack(side="left", padx=(7, 0))
+            elif self.state.my_role == OBSERVER:
+                self.observer_leave_button.pack(side="left", padx=(7, 0))
         else:
             self.in_game_controls.grid_remove()
             self.out_game_controls.grid()
