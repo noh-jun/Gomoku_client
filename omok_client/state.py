@@ -118,7 +118,7 @@ class AppState:
     passed_color: str | None = None
     ready_colors: set[str] = field(default_factory=set)
     turn_time_limit_sec: int | None = None
-    turn_deadline_unix_ms: int | None = None
+    turn_remaining_ms: int | None = None
     turn_revision: int = 0
     account_nickname: str | None = None
     account_id: str | None = None
@@ -187,7 +187,7 @@ class AppState:
         self.observer_members.clear()
         self.chat_messages.clear()
         self.turn_time_limit_sec = None
-        self.turn_deadline_unix_ms = None
+        self.turn_remaining_ms = None
         self.turn_revision = 0
 
     def reset_connection(self) -> None:
@@ -321,7 +321,7 @@ class AppState:
             self.passed_color = None
             self.ready_colors.clear()
             self.turn_time_limit_sec = turn_time_limit_sec
-            self.turn_deadline_unix_ms = None
+            self.turn_remaining_ms = None
             self.turn_revision = 0
             self.chat_messages.clear()
             self.game_status = "WAITING"
@@ -454,7 +454,7 @@ class AppState:
             self.passed_color = None
             self.ready_colors.clear()
             self.turn_time_limit_sec = turn_time_limit_sec
-            self.turn_deadline_unix_ms = None
+            self.turn_remaining_ms = None
             return StateChange(True, self.turn_message(), True)
 
         if message_type == "move_result":
@@ -502,7 +502,7 @@ class AppState:
             self.score = score
             self.game_status = "FINISHED"
             self.current_turn = None
-            self.turn_deadline_unix_ms = None
+            self.turn_remaining_ms = None
             self.legal_moves.clear()
             self.forbidden_moves.clear()
             self.rejected_point = None
@@ -534,15 +534,15 @@ class AppState:
             turn_time_limit_sec = _turn_time_limit_from_message(
                 data, game_type, self.turn_time_limit_sec
             )
-            turn_deadline_unix_ms = _optional_non_negative_integer(
-                data, "turn_deadline_unix_ms"
+            turn_remaining_ms = _optional_non_negative_integer(
+                data, "turn_remaining_ms"
             )
             turn_revision = _non_negative_integer(
                 data.get("turn_revision", self.turn_revision),
                 "game_state.turn_revision",
             )
-            if game_type is GameType.OTHELLO and turn_deadline_unix_ms is not None:
-                raise ValueError("Othello game_state must not contain a turn deadline")
+            if game_type is GameType.OTHELLO and turn_remaining_ms is not None:
+                raise ValueError("Othello game_state must not contain turn remaining time")
             if game_type is GameType.OTHELLO:
                 score = _validated_score(data.get("score"))
                 legal_moves = _validated_legal_moves(
@@ -578,10 +578,10 @@ class AppState:
             self.last_move = last_move
             self.turn_time_limit_sec = turn_time_limit_sec
             if turn_revision >= self.turn_revision:
-                self.turn_deadline_unix_ms = turn_deadline_unix_ms
+                self.turn_remaining_ms = turn_remaining_ms
                 self.turn_revision = turn_revision
             if normalized_status != "PLAYING":
-                self.turn_deadline_unix_ms = None
+                self.turn_remaining_ms = None
             return StateChange(True, self.status_message(), True)
 
         if message_type == "chat_message":
@@ -599,7 +599,7 @@ class AppState:
         if message_type == "player_disconnected":
             color = _required_color(data, "color")
             self.current_turn = None
-            self.turn_deadline_unix_ms = None
+            self.turn_remaining_ms = None
             self.game_status = "WAITING"
             self.winner = None
             self.loser = None
@@ -622,7 +622,7 @@ class AppState:
             if isinstance(undo_count, bool) or undo_count not in {1, 2}:
                 raise ValueError("undo_requested.undo_count must be 1 or 2")
             requester = "You" if requester_color == self.my_color else "Opponent"
-            self.turn_deadline_unix_ms = None
+            self.turn_remaining_ms = None
             return StateChange(
                 True,
                 f"{requester} requested undo of {undo_count} move(s).",
@@ -639,7 +639,7 @@ class AppState:
             if current_turn == timed_out_color:
                 raise ValueError("turn_timeout must switch to the other color")
             self.current_turn = current_turn
-            self.turn_deadline_unix_ms = None
+            self.turn_remaining_ms = None
             return StateChange(
                 True,
                 f"{timed_out_color.title()}'s turn timed out.",

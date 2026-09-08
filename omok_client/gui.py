@@ -77,7 +77,6 @@ class OmokApp:
         self._ready_request_pending = False
         self._role_change_pending = False
         self._move_pending = False
-        self._turn_timer_display_expired = False
         self._undo_pending = False
         self._undo_waiting_for_game_state = False
         self._resign_pending = False
@@ -507,9 +506,6 @@ class OmokApp:
     def _set_turn_time_display(self, text: str, warning: bool) -> None:
         """Apply presentation output from the display-only turn timer."""
         self.turn_timer_widget.set_display(text, warning)
-        self._turn_timer_display_expired = text == "00:00"
-        if self._turn_timer_display_expired:
-            self._clear_hover()
 
     def _sync_turn_timer_from_state(self) -> None:
         if self.state.game_status != "PLAYING":
@@ -517,7 +513,7 @@ class OmokApp:
             return
         self.turn_timer.synchronize(
             self.state.turn_time_limit_sec,
-            self.state.turn_deadline_unix_ms,
+            self.state.turn_remaining_ms,
             self.state.turn_revision,
         )
 
@@ -1164,7 +1160,7 @@ class OmokApp:
             return
         if self.board_overlay.consume_click():
             return
-        if self._move_pending or self._turn_timer_display_expired:
+        if self._move_pending:
             return
         coordinate = self._pointer_to_board(event.x, event.y)
         if coordinate is None:
@@ -1198,7 +1194,6 @@ class OmokApp:
             or self.ready_blocking_overlay.visible
             or self.undo_blocking_overlay.visible
             or self.board_overlay.visible
-            or self._turn_timer_display_expired
         ):
             self._clear_hover()
             return
@@ -2063,7 +2058,6 @@ class OmokApp:
         if (
             coordinate is None
             or self._move_pending
-            or self._turn_timer_display_expired
             or not self.state.can_move(*coordinate)
         ):
             self.hover_position = None

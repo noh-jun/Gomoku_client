@@ -85,6 +85,7 @@ ws://192.168.1.75:8000/ws
 - 화면 상태는 `DISCONNECTED`, `LOBBY`, `IN_ROOM`으로 분리합니다. 최초에는 Connection 페이지만 표시하고 서버의 `connected` 확인을 받은 뒤 Room List가 있는 Lobby 페이지로 전환합니다. Room 입장 후에는 Game 페이지를 표시하며 연결 해제 시 Connection 페이지로 돌아갑니다.
 - Lobby는 서버 `room_list` 스냅샷을 여러 열의 Room 카드로 실시간 반영합니다. 각 카드는 Room 이름·게임 종류·보드 크기·인원·상태를 표시하고, `room_id`는 화면에 노출하지 않은 채 선택과 입장 요청의 내부 키로만 사용합니다. Create Room Canvas 모달에서 Gomoku 또는 Othello를 선택할 수 있으며 신규 요청에는 항상 `game_type`을 포함합니다.
 - 클릭 시 로컬 보드를 먼저 변경하지 않습니다. 서버의 `move_result`가 도착해야 돌이 표시되며, 응답 전까지 같은 착수의 중복 전송을 막습니다.
+- 오목 착수 제한 시간은 서버가 보낸 `turn_remaining_ms`를 수신한 뒤 로컬 monotonic clock으로만 감소시킵니다. PC의 날짜·시간 설정은 계산에 사용하지 않으며 실제 턴 만료는 서버가 판정합니다.
 - Restart 버튼도 요청만 보내며, 서버의 `restart`가 도착해야 보드를 초기화합니다.
 - 오목은 기존 `BoardGeometry`로 15×15/19×19 교차점 좌표를 사용합니다. 오셀로는 `OthelloBoardGeometry`로 녹색 8×8 셀과 셀 중앙 좌표를 사용합니다. 두 렌더러 모두 resize 후 좌표를 다시 계산합니다.
 - 오목 Hover는 내 차례의 빈 교차점에, 오셀로 Hover와 합법 수 표시는 서버가 보낸 `legal_moves`에만 나타납니다. 클라이언트는 뒤집을 돌이나 pass를 직접 계산하지 않습니다.
@@ -111,7 +112,7 @@ Client → Server 메시지는 `get_room_list`, `create_room`, `join_room`, `lea
 - `game_start`: `game_type`, `your_color`, `starting_color`, `current_turn`, `board_size`, `win_length`
 - `move_result`: `game_type`, `x`, `y`, `color`, `next_turn`; 오셀로는 `flipped`, `passed_color` 추가
 - `game_over`: `game_type`, `winner`, `loser`, `reason`, `forbidden_type`, `message`, `x`, `y`; 오셀로는 `score` 추가
-- `game_state`: `game_type`, `starting_color`, `current_turn`, `winner`, `loser`, `status`, `game_over_reason`, `forbidden_type`, `board`; 오셀로는 `score`, `legal_moves` 추가
+- `game_state`: `game_type`, `starting_color`, `current_turn`, `winner`, `loser`, `status`, `game_over_reason`, `forbidden_type`, `board`, `turn_remaining_ms`, `turn_revision`; 오셀로는 `score`, `legal_moves` 추가
 - `restart`: `game_type`, `your_color`, `starting_color`, `current_turn`, `board_size`, `win_length`
 
 `reason: "forbidden_move"`일 때 `forbidden_type`은 `DOUBLE_THREE`, `DOUBLE_FOUR`, `OVERLINE` 중 하나입니다. 클라이언트는 이를 표시만 하며 금수 또는 승패를 직접 판정하지 않습니다. 종료 상태는 `FINISHED`로 표시하고 보드와 마지막 착수는 그대로 유지합니다.

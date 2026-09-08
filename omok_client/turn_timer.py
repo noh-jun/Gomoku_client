@@ -12,7 +12,7 @@ TimerDisplayCallback = Callable[[str, bool], None]
 
 
 class TurnTimer:
-    """Convert a server deadline into text without deciding game state.
+    """Convert a server-provided remaining duration into display text.
 
     The server remains authoritative for expiration and turn changes. This
     class only schedules Tk callbacks and reports display text to its owner.
@@ -40,36 +40,42 @@ class TurnTimer:
     def synchronize(
         self,
         turn_time_limit_sec: int | None,
-        turn_deadline_unix_ms: int | None,
+        turn_remaining_ms: int | None,
         turn_revision: int,
     ) -> bool:
         """Apply timer data from an authoritative game-state snapshot.
 
         Returns ``False`` when the snapshot revision is older than the timer
-        already displayed. Network latency is measured once with wall-clock
-        time; subsequent countdown updates use the monotonic clock.
+        already displayed. A same-revision snapshot cannot rewind an active
+        countdown. Both initial duration and subsequent updates avoid the PC's
+        wall clock and use only monotonic elapsed time.
         """
         if turn_revision < self._turn_revision:
+            return False
+        if (
+            turn_revision == self._turn_revision
+            and turn_remaining_ms is not None
+            and self._mode == "running"
+            and turn_remaining_ms / 1000.0 > self._remaining_now()
+        ):
             return False
 
         self._cancel_scheduled_update()
         self._turn_revision = turn_revision
         self._turn_time_limit_sec = turn_time_limit_sec
 
-        if turn_deadline_unix_ms is None and turn_time_limit_sec is None:
+        if turn_remaining_ms is None and turn_time_limit_sec is None:
             self._mode = "infinite"
             self._emit("∞", False)
             return True
 
-        if turn_deadline_unix_ms is None:
+        if turn_remaining_ms is None:
             self._mode = "inactive"
             self._emit("--", False)
             return True
 
         self._mode = "running"
-        self._remaining_at_sync = max(
-            0.0, turn_deadline_unix_ms / 1000.0 - time.time()
-        )
+        self._remaining_at_sync = max(0.0, turn_remaining_ms / 1000.0)
         self._synced_monotonic = time.monotonic()
         generation = self._generation
         self._update(generation)
@@ -96,8 +102,7 @@ class TurnTimer:
     def _update(self, generation: int) -> None:
         if generation != self._generation or self._mode != "running":
             return
-        elapsed = max(0.0, time.monotonic() - self._synced_monotonic)
-        remaining = max(0.0, self._remaining_at_sync - elapsed)
+        remaining = self._remaining_now()
         seconds = int(math.ceil(remaining))
         self._emit(
             f"{seconds // 60:02d}:{seconds % 60:02d}",
@@ -110,6 +115,10 @@ class TurnTimer:
             )
         else:
             self._after_id = None
+
+    def _remaining_now(self) -> float:
+        elapsed = max(0.0, time.monotonic() - self._synced_monotonic)
+        return max(0.0, self._remaining_at_sync - elapsed)
 
     def _cancel_scheduled_update(self) -> None:
         self._generation += 1
