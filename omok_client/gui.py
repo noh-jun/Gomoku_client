@@ -1363,7 +1363,7 @@ class OmokApp:
             self.state.reset_connection()
             self._reset_board_popup()
             self._clear_pending_requests()
-            self.turn_timer.deactivate()
+            self.turn_timer.reset_session()
             self.room_member_list.set_members((), ())
             self.chat_panel.clear()
             if not self._closing and not self.message_var.get().startswith("Connection lost"):
@@ -1464,7 +1464,7 @@ class OmokApp:
             self._ready_request_pending = False
             self._role_change_pending = False
             self._move_pending = False
-            self.turn_timer.deactivate()
+            self.turn_timer.reset_session()
             self.room_member_list.set_members((), ())
             self.chat_panel.clear()
         elif message_type == "left_room":
@@ -1473,7 +1473,7 @@ class OmokApp:
             self._ready_request_pending = False
             self._role_change_pending = False
             self._move_pending = False
-            self.turn_timer.deactivate()
+            self.turn_timer.reset_session()
             self.room_member_list.set_members((), ())
             self.chat_panel.clear()
             self.network.request_room_list()

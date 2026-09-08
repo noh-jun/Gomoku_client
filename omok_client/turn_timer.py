@@ -95,6 +95,16 @@ class TurnTimer:
         self._remaining_at_sync = 0.0
         self._emit("--", False)
 
+    def reset_session(self) -> None:
+        """Clear countdown state when entering or leaving a room session."""
+        self._cancel_scheduled_update()
+        self._turn_revision = 0
+        self._turn_time_limit_sec = None
+        self._remaining_at_sync = 0.0
+        self._synced_monotonic = 0.0
+        self._mode = "inactive"
+        self._emit("--", False)
+
     def close(self) -> None:
         """Cancel the pending Tk callback during application shutdown."""
         self._cancel_scheduled_update()
