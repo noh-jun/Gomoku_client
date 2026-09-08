@@ -10,6 +10,7 @@ from typing import Any
 
 import websockets
 
+from .chat import normalize_chat_text
 from .game_type import GameType
 from .protocol import ClientProtocolError, decode_server_message, encode_message
 
@@ -114,6 +115,9 @@ class NetworkClient:
 
     def resign(self) -> None:
         self._submit_send(encode_message("resign"))
+
+    def send_chat(self, text: str) -> None:
+        self._submit_send(encode_message("chat", text=normalize_chat_text(text)))
 
     def ping(self) -> None:
         self._submit_send(encode_message("ping"))

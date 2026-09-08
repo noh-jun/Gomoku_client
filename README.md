@@ -99,7 +99,7 @@ ws://192.168.1.75:8000/ws
 
 ## 프로토콜
 
-Client → Server 메시지는 `get_room_list`, `create_room`, `join_room`, `leave_room`, `move`, `restart_request`, `ping`을 사용합니다. `create_room`은 `room_name`과 `GOMOKU` 또는 `OTHELLO`의 `game_type`을 전송합니다. Server → Client 메시지는 `connected`, `room_list`, `room_created`, `joined`, `left_room`, `player_joined`, `game_start`, `move_result`, `game_over`, `game_state`, `player_disconnected`, `restart`, `error`, `pong`을 처리합니다.
+Client → Server 메시지는 `get_room_list`, `create_room`, `join_room`, `leave_room`, `move`, `chat`, `restart_request`, `ping`을 사용합니다. `chat`은 `text` 하나를 전송하며 Room 전원에게 `chat_message`로 되돌아옵니다([계약](docs/room-chat-client-contract.md)). `create_room`은 `room_name`과 `GOMOKU` 또는 `OTHELLO`의 `game_type`을 전송합니다. Server → Client 메시지는 `connected`, `room_list`, `room_created`, `joined`, `left_room`, `player_joined`, `game_start`, `move_result`, `game_over`, `game_state`, `player_disconnected`, `chat_message`, `restart`, `error`, `pong`을 처리합니다.
 
 서버 연결 주소는 `/ws`이며 Room ID를 URL에 포함하지 않습니다. `connected.supported_game_types`가 없으면 구버전 서버로 보고 Gomoku만 생성할 수 있습니다. `room_list`, `room_created`, `joined`의 명시적인 알 수 없는 `game_type`은 거부합니다. 현재 구현은 오셀로 `board_size: 8`, `win_length: null`만 허용합니다. 전체 계약은 [오셀로 클라이언트 개발 가이드](docs/othello-client-development-guide.md)를 참고하십시오. Room별 8/10/12 크기 선택 후속 작업은 [오셀로 보드 크기 클라이언트 개발 지시서](docs/othello-board-size-client-development-guide.md)를 따릅니다.
 

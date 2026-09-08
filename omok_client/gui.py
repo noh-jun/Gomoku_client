@@ -26,6 +26,8 @@ from .client_settings import (
 from .game_type import GameType
 from .network import NetworkClient, NetworkEvent
 from .nickname import normalize_nickname
+from .chat import normalize_chat_text
+from .chat_panel import ChatPanel
 from .room_member_list import RoomMemberList
 from .room_name import MAX_ROOM_NAME_LENGTH, normalize_room_name
 from .state import (
@@ -477,10 +479,15 @@ class OmokApp:
             highlightbackground="#7B542B",
         )
         self.canvas.grid(row=1, column=0, pady=(7, 0), sticky="nsew")
-        self.room_member_list = RoomMemberList(self.game_frame)
-        self.room_member_list.grid(
-            row=0, column=1, rowspan=2, padx=(7, 0), sticky="nsew"
-        )
+        side_panel = ttk.Frame(self.game_frame)
+        side_panel.grid(row=0, column=1, rowspan=2, padx=(7, 0), sticky="nsew")
+        side_panel.columnconfigure(0, weight=1)
+        side_panel.rowconfigure(0, weight=1)
+        side_panel.rowconfigure(1, weight=1)
+        self.room_member_list = RoomMemberList(side_panel)
+        self.room_member_list.grid(row=0, column=0, sticky="nsew")
+        self.chat_panel = ChatPanel(side_panel, on_send=self._send_chat_message)
+        self.chat_panel.grid(row=1, column=0, sticky="nsew", pady=(10, 0))
         self.canvas.bind("<Button-1>", self._on_board_click)
         self.canvas.bind("<Motion>", self._on_mouse_move)
         self.canvas.bind("<Leave>", self._on_mouse_leave)
@@ -1076,6 +1083,24 @@ class OmokApp:
         self.network.respond_undo(accepted)
         self.message_var.set("Undo response sent. Waiting for server...")
 
+    def _send_chat_message(self, text: str) -> bool:
+        """Validate the composer text and hand it to the network layer.
+
+        Returns True when the message was sent so the composer can clear itself.
+        The log is not touched here; it re-renders when the server echoes the
+        message back as ``chat_message``.
+        """
+        if self.state.view_state != IN_ROOM or not self.state.connected:
+            self.message_var.set("방에 입장한 뒤에 채팅할 수 있습니다.")
+            return False
+        try:
+            normalized = normalize_chat_text(text)
+        except ValueError as exc:
+            self.message_var.set(str(exc))
+            return False
+        self.network.send_chat(normalized)
+        return True
+
     def _request_resign(self) -> None:
         if (
             self.state.view_state != IN_ROOM
@@ -1338,6 +1363,7 @@ class OmokApp:
             self._clear_pending_requests()
             self.turn_timer.deactivate()
             self.room_member_list.set_members((), ())
+            self.chat_panel.clear()
             if not self._closing and not self.message_var.get().startswith("Connection lost"):
                 self.message_var.set(event.message)
         elif event.kind in {"network_error", "protocol_error"}:
@@ -1380,7 +1406,7 @@ class OmokApp:
         is_forbidden_error = (
             message_type == "error" and payload.get("code") == "FORBIDDEN_MOVE"
         )
-        if message_type == "room_list":
+        if message_type in {"room_list", "chat_message"}:
             pass
         elif is_forbidden_error:
             self.message_var.set(self.state.turn_message())
@@ -1438,6 +1464,7 @@ class OmokApp:
             self._move_pending = False
             self.turn_timer.deactivate()
             self.room_member_list.set_members((), ())
+            self.chat_panel.clear()
         elif message_type == "left_room":
             self._reset_board_popup()
             self._leave_pending = False
@@ -1446,6 +1473,7 @@ class OmokApp:
             self._move_pending = False
             self.turn_timer.deactivate()
             self.room_member_list.set_members((), ())
+            self.chat_panel.clear()
             self.network.request_room_list()
         elif message_type == "error":
             self._clear_pending_requests()
@@ -1469,6 +1497,8 @@ class OmokApp:
             )
             if not self.state.my_ready:
                 self.ready_blocking_overlay.clear_from_system()
+        elif message_type == "chat_message":
+            self.chat_panel.set_messages(self.state.chat_messages)
         elif message_type == "ready_confirmed":
             self._ready_request_pending = False
             if self.state.is_finished:
@@ -1800,6 +1830,9 @@ class OmokApp:
             and not self._resign_pending
         )
         self.resign_button.configure(state="normal" if can_resign else "disabled")
+        self.chat_panel.set_enabled(
+            self.state.view_state == IN_ROOM and self.state.connected
+        )
         if self.state.game_status == "PLAYING":
             self.out_game_controls.grid_remove()
             self.in_game_controls.grid()

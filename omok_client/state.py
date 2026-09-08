@@ -6,6 +6,7 @@ from typing import Any
 from .game_type import GameType
 from .account import normalize_account_id
 from .room_name import normalize_room_name
+from .chat import normalize_chat_text
 from .nickname import normalize_nickname
 
 DEFAULT_BOARD_SIZE = 15
@@ -31,6 +32,7 @@ FORBIDDEN_LABELS = {
 }
 FORBIDDEN_TYPES = frozenset(FORBIDDEN_LABELS)
 SUPPORTED_TURN_TIME_LIMITS = frozenset({5, 10, 15, 30, 60})
+MAX_CHAT_HISTORY = 200
 
 
 def new_board(board_size: int = DEFAULT_BOARD_SIZE) -> list[list[str | None]]:
@@ -54,6 +56,13 @@ class RoomMember:
     nickname: str
     color: str | None = None
     ready: bool = False
+
+
+@dataclass(frozen=True)
+class ChatMessage:
+    nickname: str
+    text: str
+    sent_at_unix_ms: int
 
 
 @dataclass(frozen=True)
@@ -116,6 +125,7 @@ class AppState:
     authenticated: bool = False
     player_members: list[RoomMember] = field(default_factory=list)
     observer_members: list[RoomMember] = field(default_factory=list)
+    chat_messages: list[ChatMessage] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         effective_type = self.game_type or GameType.GOMOKU
@@ -175,6 +185,7 @@ class AppState:
         self.ready_colors.clear()
         self.player_members.clear()
         self.observer_members.clear()
+        self.chat_messages.clear()
         self.turn_time_limit_sec = None
         self.turn_deadline_unix_ms = None
         self.turn_revision = 0
@@ -312,6 +323,7 @@ class AppState:
             self.turn_time_limit_sec = turn_time_limit_sec
             self.turn_deadline_unix_ms = None
             self.turn_revision = 0
+            self.chat_messages.clear()
             self.game_status = "WAITING"
             return StateChange(True, "Joined as observer.", True)
 
@@ -572,6 +584,18 @@ class AppState:
                 self.turn_deadline_unix_ms = None
             return StateChange(True, self.status_message(), True)
 
+        if message_type == "chat_message":
+            if self.view_state != IN_ROOM:
+                raise ValueError("chat_message is only valid inside a room")
+            nickname = normalize_nickname(data.get("nickname"))
+            text = normalize_chat_text(data.get("text"))
+            sent_at_unix_ms = _non_negative_integer(
+                data.get("sent_at_unix_ms"), "chat_message.sent_at_unix_ms"
+            )
+            self.chat_messages.append(ChatMessage(nickname, text, sent_at_unix_ms))
+            del self.chat_messages[:-MAX_CHAT_HISTORY]
+            return StateChange(True, f"{nickname}: {text}")
+
         if message_type == "player_disconnected":
             color = _required_color(data, "color")
             self.current_turn = None
@@ -716,6 +740,9 @@ class AppState:
                     "INVALID_CREDENTIALS": "Account ID 또는 Password가 올바르지 않습니다.",
                     "ALREADY_AUTHENTICATED": "이미 로그인되어 있습니다.",
                     "LOGIN_FAILED": "로그인을 완료하지 못했습니다.",
+                    "CHAT_NOT_AVAILABLE": "방에 입장한 뒤에 채팅할 수 있습니다.",
+                    "CHAT_TEXT_INVALID": "채팅은 1~200자로 입력해 주세요.",
+                    "CHAT_RATE_LIMITED": "채팅을 너무 빨리 보내고 있습니다. 잠시 후 다시 시도해 주세요.",
                 }
                 detail = localized.get(code, f"{detail} [{code}]")
             return StateChange(True, detail)
