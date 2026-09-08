@@ -874,8 +874,8 @@ class OmokApp:
                 if raw_turn_time == INFINITE_TURN_TIME
                 else int(raw_turn_time)
             )
-            if game_type is GameType.OTHELLO and turn_time_limit_sec is not None:
-                raise ValueError("오셀로는 착수 제한 시간을 지원하지 않습니다.")
+            if turn_time_limit_sec not in self.state.turn_time_limits_for(game_type):
+                raise ValueError("서버가 지원하지 않는 착수 제한 시간입니다.")
         except ValueError as exc:
             self._create_room_error_var.set(str(exc))
             return
@@ -898,12 +898,20 @@ class OmokApp:
         self._render_controls()
 
     def _on_create_room_game_type_changed(self) -> None:
-        is_gomoku = self._create_room_game_type_var.get() == GameType.GOMOKU.value
-        if not is_gomoku:
-            self._create_room_turn_time_var.set(INFINITE_TURN_TIME)
-        state = "normal" if is_gomoku else "disabled"
-        for radio in self.create_turn_time_radios:
-            radio.configure(state=state)
+        game_type = GameType.from_wire(self._create_room_game_type_var.get())
+        allowed = set(self.state.turn_time_limits_for(game_type))
+        raw_selected = self._create_room_turn_time_var.get()
+        selected = (
+            None if raw_selected == INFINITE_TURN_TIME else int(raw_selected)
+        )
+        if selected not in allowed:
+            replacement = None if None in allowed else next(iter(allowed))
+            self._create_room_turn_time_var.set(
+                INFINITE_TURN_TIME if replacement is None else str(replacement)
+            )
+        for value, radio in zip(TURN_TIME_OPTIONS, self.create_turn_time_radios):
+            limit = None if value == INFINITE_TURN_TIME else int(value)
+            radio.configure(state="normal" if limit in allowed else "disabled")
 
     def _open_join_room_modal(self, room_id: str) -> None:
         room = next((item for item in self.state.rooms if item.room_id == room_id), None)

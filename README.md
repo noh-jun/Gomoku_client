@@ -90,6 +90,7 @@ ws://192.168.1.75:8000/ws
 - 오목은 기존 `BoardGeometry`로 15×15/19×19 교차점 좌표를 사용합니다. 오셀로는 `OthelloBoardGeometry`로 녹색 8×8 셀과 셀 중앙 좌표를 사용합니다. 두 렌더러 모두 resize 후 좌표를 다시 계산합니다.
 - 오목 Hover는 내 차례의 빈 교차점에, 오셀로 Hover와 합법 수 표시는 서버가 보낸 `legal_moves`에만 나타납니다. 클라이언트는 뒤집을 돌이나 pass를 직접 계산하지 않습니다.
 - 오셀로 `move_result.flipped`는 서버가 지정한 셀을 즉시 갱신하고, 뒤이어 받은 authoritative `game_state`가 board·score·legal moves 전체를 교정합니다.
+- 서버가 `connected.room_creation_options.OTHELLO`에 제한시간과 `RANDOM_LEGAL_MOVE` 동작을 광고하면 오셀로 방에서도 Turn Timer를 선택할 수 있습니다. 시간 초과 시 `turn_timeout`은 비차단 안내만 표시하고, 실제 자동 착수와 뒤집기는 뒤이어 오는 `move_result`와 authoritative `game_state`로 반영합니다. capability가 없는 구버전 서버에서는 오셀로 제한시간을 비활성화합니다.
 - 선공 색상과 현재 턴은 서버의 `starting_color`, `current_turn`을 따르므로 WHITE 선공도 지원합니다. 종료 시 정상 승패·무승부 및 `DOUBLE_THREE`, `DOUBLE_FOUR`, `OVERLINE` 금수 원인을 메인 화면에 표시합니다.
 - 승패 또는 무승부가 확정되면 최종 보드를 유지한 채 결과를 보드 중앙에 표시합니다. 오목은 기존 금수 사유를, 오셀로는 서버 winner와 `Black n · White n` 점수를 표시합니다.
 - 보드 중앙 안내는 범용 `CanvasOverlay`를 사용합니다. 승패와 금수 착수 안내 팝업은 클릭하면 닫히며, 닫는 클릭은 착수 입력으로 전달되지 않습니다.

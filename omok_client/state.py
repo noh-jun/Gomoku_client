@@ -32,6 +32,11 @@ FORBIDDEN_LABELS = {
 }
 FORBIDDEN_TYPES = frozenset(FORBIDDEN_LABELS)
 SUPPORTED_TURN_TIME_LIMITS = frozenset({5, 10, 15, 30, 60})
+DEFAULT_TURN_TIME_LIMITS = (None, 5, 10, 15, 30, 60)
+TIMEOUT_ACTIONS = {
+    GameType.GOMOKU: "SKIP_TURN",
+    GameType.OTHELLO: "RANDOM_LEGAL_MOVE",
+}
 MAX_CHAT_HISTORY = 200
 
 
@@ -66,6 +71,22 @@ class ChatMessage:
 
 
 @dataclass(frozen=True)
+class RoomCreationOptions:
+    turn_time_limits: tuple[int | None, ...]
+    timeout_action: str
+
+
+def legacy_room_creation_options() -> dict[GameType, RoomCreationOptions]:
+    """Capabilities assumed for a server without room_creation_options."""
+    return {
+        GameType.GOMOKU: RoomCreationOptions(
+            DEFAULT_TURN_TIME_LIMITS,
+            TIMEOUT_ACTIONS[GameType.GOMOKU],
+        )
+    }
+
+
+@dataclass(frozen=True)
 class RoomSummary:
     room_id: str
     room_name: str
@@ -94,6 +115,9 @@ class AppState:
     game_type: GameType | None = None
     supported_game_types: set[GameType] = field(
         default_factory=lambda: {GameType.GOMOKU}
+    )
+    room_creation_options: dict[GameType, RoomCreationOptions] = field(
+        default_factory=legacy_room_creation_options
     )
     my_color: str | None = None
     my_role: str | None = None
@@ -197,7 +221,12 @@ class AppState:
         self.authenticated = False
         self.rooms = []
         self.supported_game_types = {GameType.GOMOKU}
+        self.room_creation_options = legacy_room_creation_options()
         self.reset_room_state()
+
+    def turn_time_limits_for(self, game_type: GameType) -> tuple[int | None, ...]:
+        options = self.room_creation_options.get(game_type)
+        return options.turn_time_limits if options is not None else (None,)
 
     def can_move(self, x: int, y: int) -> bool:
         common = (
@@ -250,8 +279,12 @@ class AppState:
 
         if message_type == "connected":
             supported = _validated_supported_game_types(data.get("supported_game_types"))
+            room_creation_options = _validated_room_creation_options(
+                data.get("room_creation_options"), supported
+            )
             self.connected = True
             self.supported_game_types = supported
+            self.room_creation_options = room_creation_options
             self.view_state = DISCONNECTED
             self.game_status = DISCONNECTED
             return StateChange(True, "Connected. Log in to continue.")
@@ -541,8 +574,6 @@ class AppState:
                 data.get("turn_revision", self.turn_revision),
                 "game_state.turn_revision",
             )
-            if game_type is GameType.OTHELLO and turn_remaining_ms is not None:
-                raise ValueError("Othello game_state must not contain turn remaining time")
             if game_type is GameType.OTHELLO:
                 score = _validated_score(data.get("score"))
                 legal_moves = _validated_legal_moves(
@@ -630,20 +661,32 @@ class AppState:
 
         if message_type == "turn_timeout":
             game_type = _message_game_type(data, self.game_type)
-            if game_type is not GameType.GOMOKU:
-                raise ValueError("turn_timeout.game_type must be GOMOKU")
             if self.game_type is not None and game_type is not self.game_type:
                 raise ValueError("turn_timeout.game_type does not match current room")
             timed_out_color = _required_color(data, "timed_out_color")
-            current_turn = _required_color(data, "current_turn")
-            if current_turn == timed_out_color:
-                raise ValueError("turn_timeout must switch to the other color")
+            if game_type is GameType.GOMOKU:
+                current_turn = _required_color(data, "current_turn")
+                if current_turn == timed_out_color:
+                    raise ValueError("turn_timeout must switch to the other color")
+                message = f"{timed_out_color.title()}'s turn timed out."
+            else:
+                current_turn = _optional_color(data, "current_turn", None)
+                if data.get("action") != "RANDOM_LEGAL_MOVE":
+                    raise ValueError(
+                        "OTHELLO turn_timeout.action must be RANDOM_LEGAL_MOVE"
+                    )
+                move = data.get("move")
+                if not isinstance(move, dict):
+                    raise ValueError("OTHELLO turn_timeout.move must be an object")
+                x = _required_coordinate(move, "x", self.board_size)
+                y = _required_coordinate(move, "y", self.board_size)
+                message = (
+                    f"{timed_out_color.title()} timed out. "
+                    f"Server auto-move: ({x}, {y})."
+                )
             self.current_turn = current_turn
             self.turn_remaining_ms = None
-            return StateChange(
-                True,
-                f"{timed_out_color.title()}'s turn timed out.",
-            )
+            return StateChange(True, message)
 
         if message_type == "undo_result":
             game_type = _message_game_type(data, self.game_type)
@@ -834,6 +877,63 @@ def _validated_supported_game_types(value: Any) -> set[GameType]:
     return {GameType.from_wire(item) for item in value}
 
 
+def _validated_room_creation_options(
+    value: Any, supported: set[GameType]
+) -> dict[GameType, RoomCreationOptions]:
+    if value is None:
+        return {
+            game_type: options
+            for game_type, options in legacy_room_creation_options().items()
+            if game_type in supported
+        }
+    if not isinstance(value, dict):
+        raise ValueError("connected.room_creation_options must be an object")
+
+    validated: dict[GameType, RoomCreationOptions] = {}
+    for game_type in supported:
+        raw = value.get(game_type.value)
+        if raw is None:
+            continue
+        if not isinstance(raw, dict):
+            raise ValueError(
+                f"connected.room_creation_options.{game_type.value} must be an object"
+            )
+        limits = raw.get("turn_time_limits")
+        if not isinstance(limits, list) or not limits:
+            raise ValueError(
+                f"{game_type.value}.turn_time_limits must be a non-empty list"
+            )
+        parsed_limits: list[int | None] = []
+        for limit in limits:
+            if limit is not None and (
+                isinstance(limit, bool)
+                or not isinstance(limit, int)
+                or limit not in SUPPORTED_TURN_TIME_LIMITS
+            ):
+                raise ValueError(
+                    f"{game_type.value}.turn_time_limits contains an invalid value"
+                )
+            if limit in parsed_limits:
+                raise ValueError(
+                    f"{game_type.value}.turn_time_limits contains duplicates"
+                )
+            parsed_limits.append(limit)
+        if None not in parsed_limits:
+            raise ValueError(
+                f"{game_type.value}.turn_time_limits must include null"
+            )
+        timeout_action = raw.get("timeout_action")
+        if timeout_action != TIMEOUT_ACTIONS[game_type]:
+            raise ValueError(
+                f"{game_type.value}.timeout_action must be "
+                f"{TIMEOUT_ACTIONS[game_type]}"
+            )
+        validated[game_type] = RoomCreationOptions(
+            tuple(parsed_limits), timeout_action
+        )
+    return validated
+
+
 def _settings_from_message(
     data: dict[str, Any],
     game_type: GameType,
@@ -860,8 +960,6 @@ def _turn_time_limit_from_message(
         or value not in SUPPORTED_TURN_TIME_LIMITS
     ):
         raise ValueError("turn_time_limit_sec must be 5, 10, 15, 30, 60, or null")
-    if game_type is GameType.OTHELLO and value is not None:
-        raise ValueError("OTHELLO does not support a turn timer")
     return value
 
 
